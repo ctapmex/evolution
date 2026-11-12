@@ -7,6 +7,7 @@
 #include <camel/camel.h>
 
 #include "e-mail-part-list.h"
+#include "e-mail-part-utils.h"
 
 struct _EMailPartListPrivate {
 	CamelFolder *folder;
@@ -304,11 +305,14 @@ e_mail_part_list_ref_part (EMailPartList *part_list,
 	EMailPart *match = NULL;
 	GList *head, *link;
 	gboolean by_cid;
+	gchar *request_cid = NULL;
 
 	g_return_val_if_fail (E_IS_MAIL_PART_LIST (part_list), NULL);
 	g_return_val_if_fail (part_id != NULL, NULL);
 
 	by_cid = (g_ascii_strncasecmp (part_id, "cid:", 4) == 0);
+	if (by_cid)
+		request_cid = e_mail_part_dup_cid_uri (part_id);
 
 	g_mutex_lock (&part_list->priv->queue_lock);
 
@@ -317,19 +321,28 @@ e_mail_part_list_ref_part (EMailPartList *part_list,
 	for (link = head; link != NULL; link = g_list_next (link)) {
 		EMailPart *candidate = E_MAIL_PART (link->data);
 		const gchar *candidate_id;
+		gboolean found;
 
 		if (by_cid)
 			candidate_id = e_mail_part_get_cid (candidate);
 		else
 			candidate_id = e_mail_part_get_id (candidate);
 
-		if (g_strcmp0 (candidate_id, part_id) == 0) {
+		if (by_cid)
+			found = request_cid && candidate_id &&
+				g_ascii_strcasecmp (candidate_id, request_cid) == 0;
+		else
+			found = g_strcmp0 (candidate_id, part_id) == 0;
+
+		if (found) {
 			match = g_object_ref (candidate);
 			break;
 		}
 	}
 
 	g_mutex_unlock (&part_list->priv->queue_lock);
+
+	g_free (request_cid);
 
 	return match;
 }

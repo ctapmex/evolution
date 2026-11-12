@@ -126,8 +126,39 @@ emfe_text_html_format (EMailFormatterExtension *extension,
 		return FALSE;
 
 	if (context->mode == E_MAIL_FORMATTER_MODE_RAW) {
+		GOutputStream *mem;
+		GBytes *bytes;
+		gchar *html, *rewritten;
+		const guint8 *data;
+		gsize length;
+
+		mem = g_memory_output_stream_new_resizable ();
 		e_mail_formatter_format_text (
-			formatter, part, stream, cancellable);
+			formatter, part, mem, cancellable);
+		g_output_stream_close (mem, cancellable, NULL);
+
+		bytes = g_memory_output_stream_steal_as_bytes (G_MEMORY_OUTPUT_STREAM (mem));
+		g_object_unref (mem);
+
+		data = g_bytes_get_data (bytes, &length);
+		html = g_strndup ((const gchar *) data, length);
+
+		rewritten = e_mail_part_rewrite_cid_uris (html);
+		if (rewritten) {
+			g_output_stream_write_all (
+				stream, rewritten, strlen (rewritten),
+				NULL, cancellable, NULL);
+			g_free (rewritten);
+		} else if (length) {
+			g_output_stream_write_all (
+				stream, data, length,
+				NULL, cancellable, NULL);
+		}
+
+		g_bytes_unref (bytes);
+		g_free (html);
+
+		return TRUE;
 
 	} else if (context->mode == E_MAIL_FORMATTER_MODE_PRINTING) {
 		GOutputStream *decoded_stream;
@@ -306,6 +337,16 @@ emfe_text_html_format (EMailFormatterExtension *extension,
 
 		if (valid)
 			g_string_truncate (string, tag - string->str);
+
+		{
+			gchar *rewritten;
+
+			rewritten = e_mail_part_rewrite_cid_uris (string->str);
+			if (rewritten) {
+				g_string_assign (string, rewritten);
+				g_free (rewritten);
+			}
+		}
 
 		g_output_stream_write_all (
 			stream, string->str, string->len,

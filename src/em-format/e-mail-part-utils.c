@@ -699,6 +699,171 @@ e_mail_part_utils_body_refers (const gchar *body,
 	return FALSE;
 }
 
+/* WebKitGTK only allows cross-origin loads of cid://host/path, not opaque cid:id@host. */
+#define E_MAIL_PART_CID_URI_HOST "evo"
+
+static gboolean
+cid_uri_is_reference (const gchar *html,
+		      const gchar *cid,
+		      gchar *out_delimiter)
+{
+	const gchar *p;
+
+	*out_delimiter = 0;
+
+	if (!html || cid <= html)
+		return FALSE;
+
+	p = cid - 1;
+	while (p > html && g_ascii_isspace (*p))
+		p--;
+
+	if (*p == '"' || *p == '\'') {
+		*out_delimiter = *p;
+		return TRUE;
+	}
+
+	return *p == '(' || *p == '=';
+}
+
+static const gchar *
+cid_uri_content_id_end (const gchar *id,
+			gchar delimiter)
+{
+	if (delimiter == '"' || delimiter == '\'') {
+		while (*id && *id != delimiter)
+			id++;
+
+		return id;
+	}
+
+	while (*id &&
+	       !g_ascii_isspace (*id) &&
+	       *id != '"' && *id != '\'' &&
+	       *id != ')' && *id != '<' &&
+	       *id != '>' && *id != ',' &&
+	       *id != '?' && *id != '#')
+		id++;
+
+	return id;
+}
+
+/**
+ * e_mail_part_dup_cid_uri:
+ * @uri: a URI which may be an opaque "cid:…" or "cid://evo/…" reference
+ *
+ * Turns a Content-ID request URI into the canonical "cid:&lt;content-id&gt;"
+ * form used on #EMailPart. Hierarchical "cid://evo/&lt;percent-encoded-id&gt;"
+ * URIs, which the mail preview uses so WebKitGTK can load them, are decoded.
+ * The comparison of the result with a stored Content-ID is case-insensitive.
+ *
+ * Returns: (transfer full) (nullable): a newly allocated "cid:…" URI, or %NULL
+ *    when @uri is not a Content-ID URI
+ **/
+gchar *
+e_mail_part_dup_cid_uri (const gchar *uri)
+{
+	const gchar *host, *slash;
+	gchar *decoded, *canonical;
+	gsize host_len;
+
+	if (!uri || g_ascii_strncasecmp (uri, "cid:", 4) != 0)
+		return NULL;
+
+	if (g_ascii_strncasecmp (uri, "cid://", 6) != 0) {
+		if (!uri[4])
+			return NULL;
+
+		return g_strdup (uri);
+	}
+
+	host = uri + 6;
+	slash = strchr (host, '/');
+	if (!slash || slash == host || !slash[1])
+		return NULL;
+
+	host_len = slash - host;
+	if (host_len != strlen (E_MAIL_PART_CID_URI_HOST) ||
+	    g_ascii_strncasecmp (host, E_MAIL_PART_CID_URI_HOST, host_len) != 0)
+		return NULL;
+
+	decoded = g_uri_unescape_string (slash + 1, NULL);
+	if (!decoded || !*decoded) {
+		g_free (decoded);
+		return NULL;
+	}
+
+	canonical = g_strconcat ("cid:", decoded, NULL);
+	g_free (decoded);
+
+	return canonical;
+}
+
+/**
+ * e_mail_part_rewrite_cid_uris:
+ * @html: HTML to scan; can be %NULL
+ *
+ * Rewrites opaque "cid:…" references in attributes and CSS url() values to
+ * "cid://evo/&lt;percent-encoded-id&gt;", which matches the WebKitGTK CORS
+ * allow list. References that are already hierarchical are left as they are.
+ * The original MIME part is not modified; only this HTML copy changes.
+ *
+ * Returns: (transfer full) (nullable): a newly allocated HTML string when at
+ *    least one reference was rewritten, or %NULL when there is nothing to change
+ **/
+gchar *
+e_mail_part_rewrite_cid_uris (const gchar *html)
+{
+	GString *out;
+	const gchar *p;
+	gboolean changed = FALSE;
+
+	if (!html || !*html)
+		return NULL;
+
+	out = g_string_sized_new (strlen (html) + 16);
+	p = html;
+
+	while (*p) {
+		const gchar *id, *id_end;
+		gchar *content_id, *escaped;
+		gchar delimiter = 0;
+
+		if (g_ascii_strncasecmp (p, "cid:", 4) != 0 ||
+		    !cid_uri_is_reference (html, p, &delimiter) ||
+		    g_ascii_strncasecmp (p + 4, "//", 2) == 0) {
+			g_string_append_c (out, *p);
+			p++;
+			continue;
+		}
+
+		id = p + 4;
+		id_end = cid_uri_content_id_end (id, delimiter);
+		if (id_end == id) {
+			g_string_append_c (out, *p);
+			p++;
+			continue;
+		}
+
+		content_id = g_strndup (id, id_end - id);
+		escaped = g_uri_escape_string (content_id, NULL, FALSE);
+		g_string_append (out, "cid://" E_MAIL_PART_CID_URI_HOST "/");
+		g_string_append (out, escaped);
+		g_free (escaped);
+		g_free (content_id);
+
+		changed = TRUE;
+		p = id_end;
+	}
+
+	if (!changed) {
+		g_string_free (out, TRUE);
+		return NULL;
+	}
+
+	return g_string_free (out, FALSE);
+}
+
 static gboolean
 message_find_parent_part_rec (CamelMimePart *part,
 			      CamelMimePart *child,
