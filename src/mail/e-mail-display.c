@@ -3275,6 +3275,10 @@ e_mail_display_set_mode (EMailDisplay *display,
 		G_CALLBACK (e_mail_display_reload), display, G_CONNECT_SWAPPED);
 
 	e_signal_connect_notify_object (
+		formatter, "notify::pin-message-headers",
+		G_CALLBACK (e_mail_display_reload), display, G_CONNECT_SWAPPED);
+
+	e_signal_connect_notify_object (
 		formatter, "notify::show-real-date",
 		G_CALLBACK (e_mail_display_reload), display, G_CONNECT_SWAPPED);
 

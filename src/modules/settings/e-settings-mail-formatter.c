@@ -79,6 +79,11 @@ settings_mail_formatter_constructed (GObject *object)
 		G_SETTINGS_BIND_GET);
 
 	g_settings_bind (
+		settings, "pin-message-headers",
+		formatter, "pin-message-headers",
+		G_SETTINGS_BIND_GET);
+
+	g_settings_bind (
 		settings, "show-real-date",
 		formatter, "show-real-date",
 		G_SETTINGS_BIND_GET);

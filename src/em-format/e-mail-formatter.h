@@ -150,6 +150,12 @@ void		e_mail_formatter_set_show_sender_photo
 						(EMailFormatter *formatter,
 						 gboolean show_sender_photo);
 
+gboolean	e_mail_formatter_get_pin_message_headers
+						(EMailFormatter *formatter);
+void		e_mail_formatter_set_pin_message_headers
+						(EMailFormatter *formatter,
+						 gboolean pin_message_headers);
+
 gboolean	e_mail_formatter_get_animate_images
 						(EMailFormatter *formatter);
 void		e_mail_formatter_set_animate_images
