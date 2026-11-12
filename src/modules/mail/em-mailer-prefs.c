@@ -1908,6 +1908,13 @@ em_mailer_prefs_construct (EMMailerPrefs *prefs,
 
 	em_prefs_bind_settings (prefs, settings, "thread-subject", "thread-by-subject", "active");
 	em_prefs_bind_settings (prefs, settings, "thread-flat", "thread-flat", "active");
+	em_prefs_bind_settings (prefs, settings, "thread-flat-outlook", "thread-flat-outlook", "active");
+
+	widget = e_builder_get_widget (prefs->priv->builder, "thread-flat-outlook");
+	g_settings_bind (
+		settings, "thread-flat",
+		widget, "sensitive",
+		G_SETTINGS_BIND_GET);
 
 	/* Deleting Mail */
 	em_prefs_bind_settings (prefs, settings, "trash-empty-on-exit", "chkEmptyTrashOnExit", "active");
