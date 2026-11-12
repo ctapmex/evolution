@@ -89,6 +89,7 @@ struct _MessageListPrivate {
 	gboolean thread_subject;
 	gboolean thread_compress;
 	gboolean thread_flat;
+	gboolean thread_flat_outlook;
 	gboolean any_row_changed; /* save state before regen list when this is set to true */
 	gboolean regen_selects_unread;
 
@@ -143,6 +144,7 @@ struct _RegenData {
 	gboolean group_by_threads;
 	gboolean thread_subject;
 	gboolean thread_flat;
+	gboolean thread_flat_outlook;
 	gboolean thread_latest;
 	gboolean select_unread;
 
@@ -180,6 +182,7 @@ enum {
 	PROP_THREAD_SUBJECT,
 	PROP_THREAD_COMPRESS,
 	PROP_THREAD_FLAT,
+	PROP_THREAD_FLAT_OUTLOOK,
 	N_PROPS,
 	PROP_COPY_TARGET_LIST,
 	PROP_PASTE_TARGET_LIST
@@ -3332,6 +3335,12 @@ message_list_set_property (GObject *object,
 				MESSAGE_LIST (object),
 				g_value_get_boolean (value));
 			return;
+
+		case PROP_THREAD_FLAT_OUTLOOK:
+			message_list_set_thread_flat_outlook (
+				MESSAGE_LIST (object),
+				g_value_get_boolean (value));
+			return;
 	}
 
 	G_OBJECT_WARN_INVALID_PROPERTY_ID (object, property_id, pspec);
@@ -3418,6 +3427,13 @@ message_list_get_property (GObject *object,
 			g_value_set_boolean (
 				value,
 				message_list_get_thread_flat (
+				MESSAGE_LIST (object)));
+			return;
+
+		case PROP_THREAD_FLAT_OUTLOOK:
+			g_value_set_boolean (
+				value,
+				message_list_get_thread_flat_outlook (
 				MESSAGE_LIST (object)));
 			return;
 	}
@@ -3710,6 +3726,35 @@ message_list_get_node_by_id (ETreeModel *tree_model,
 	return g_hash_table_lookup (message_list->uid_nodemap, save_id);
 }
 
+static gboolean
+message_list_date_column_sorted_descending (MessageList *message_list,
+					    gint col)
+{
+	ETreeTableAdapter *adapter;
+	ETableSortInfo *sort_info;
+	gint ii, n_sorts;
+
+	adapter = e_tree_get_table_adapter (E_TREE (message_list));
+	if (!adapter)
+		return FALSE;
+
+	sort_info = e_tree_table_adapter_get_sort_info (adapter);
+	if (!sort_info)
+		return FALSE;
+
+	n_sorts = e_table_sort_info_sorting_get_count (sort_info);
+	for (ii = 0; ii < n_sorts; ii++) {
+		ETableColumnSpecification *spec;
+		GtkSortType sort_type = GTK_SORT_ASCENDING;
+
+		spec = e_table_sort_info_sorting_get_nth (sort_info, ii, &sort_type);
+		if (spec && spec->compare_col == col)
+			return sort_type == GTK_SORT_DESCENDING;
+	}
+
+	return FALSE;
+}
+
 static gpointer
 message_list_sort_value_at (ETreeModel *tree_model,
                             ETreePath path,
@@ -3719,6 +3764,7 @@ message_list_sort_value_at (ETreeModel *tree_model,
 	GNode *path_node;
 	struct LatestData ld;
 	gint64 *res;
+	gboolean is_thread_child;
 
 	message_list = MESSAGE_LIST (tree_model);
 
@@ -3742,6 +3788,17 @@ message_list_sort_value_at (ETreeModel *tree_model,
 
 	res = g_new0 (gint64, 1);
 	*res = (gint64) ld.latest;
+
+	/* Flat Outlook threads keep the newest child next to the root when
+	 * the date column is descending. thread-children-ascending flips that
+	 * direction to ascending, so negate the key to undo the flip. */
+	is_thread_child = path_node->parent && path_node->parent->parent;
+	if (is_thread_child &&
+	    message_list->priv->thread_flat &&
+	    message_list->priv->thread_flat_outlook &&
+	    e_tree_get_sort_children_ascending (E_TREE (message_list)) &&
+	    message_list_date_column_sorted_descending (message_list, col))
+		*res = -(*res);
 
 	return res;
 }
@@ -4211,6 +4268,19 @@ message_list_class_init (MessageListClass *class)
 		g_param_spec_boolean (
 			"thread-flat", NULL, NULL,
 			TRUE,
+			G_PARAM_READWRITE |
+			G_PARAM_CONSTRUCT |
+			G_PARAM_STATIC_STRINGS);
+
+	/**
+	 * MessageList:thread-flat-outlook
+	 *
+	 * Order flat threads like Outlook: latest message is the root
+	 **/
+	properties[PROP_THREAD_FLAT_OUTLOOK] =
+		g_param_spec_boolean (
+			"thread-flat-outlook", NULL, NULL,
+			FALSE,
 			G_PARAM_READWRITE |
 			G_PARAM_CONSTRUCT |
 			G_PARAM_STATIC_STRINGS);
@@ -4883,10 +4953,192 @@ ml_uid_nodemap_insert (MessageList *message_list,
 /* only call if we have a tree model */
 /* builds the tree structure */
 
+static time_t
+flat_outlook_message_date (CamelMessageInfo *info,
+			   gboolean use_sent)
+{
+	time_t primary, fallback;
+
+	if (!info)
+		return 0;
+
+	if (use_sent) {
+		primary = camel_message_info_get_date_sent (info);
+		fallback = camel_message_info_get_date_received (info);
+	} else {
+		primary = camel_message_info_get_date_received (info);
+		fallback = camel_message_info_get_date_sent (info);
+	}
+
+	if (primary > 0)
+		return primary;
+	if (fallback > 0)
+		return fallback;
+
+	return 0;
+}
+
+/* Newest root, unless the primary sort is an ascending date column. */
+static void
+flat_outlook_root_mode (MessageList *message_list,
+			gboolean *use_sent,
+			gboolean *newest_root)
+{
+	ETreeTableAdapter *adapter;
+	ETableSortInfo *sort_info;
+	ETableColumnSpecification *spec;
+	GtkSortType sort_type = GTK_SORT_ASCENDING;
+
+	*use_sent = FALSE;
+	*newest_root = TRUE;
+
+	adapter = e_tree_get_table_adapter (E_TREE (message_list));
+	if (!adapter)
+		return;
+
+	sort_info = e_tree_table_adapter_get_sort_info (adapter);
+	if (!sort_info || e_table_sort_info_sorting_get_count (sort_info) < 1)
+		return;
+
+	spec = e_table_sort_info_sorting_get_nth (sort_info, 0, &sort_type);
+	if (!spec)
+		return;
+
+	if (spec->compare_col != COL_SENT && spec->compare_col != COL_RECEIVED)
+		return;
+
+	*use_sent = spec->compare_col == COL_SENT;
+	*newest_root = sort_type != GTK_SORT_ASCENDING;
+}
+
+typedef struct {
+	GNode *node;
+	time_t date;
+	gint index;
+} FlatOutlookChild;
+
+static gint
+flat_outlook_child_cmp (gconstpointer pa,
+			gconstpointer pb,
+			gpointer user_data)
+{
+	const FlatOutlookChild *child_a = pa;
+	const FlatOutlookChild *child_b = pb;
+	gboolean newest_first = GPOINTER_TO_INT (user_data);
+
+	if (child_a->date <= 0 && child_b->date <= 0)
+		return child_a->index - child_b->index;
+	if (child_a->date <= 0)
+		return 1;
+	if (child_b->date <= 0)
+		return -1;
+
+	if (child_a->date != child_b->date) {
+		if (newest_first)
+			return (child_a->date < child_b->date) ? 1 : -1;
+
+		return (child_a->date > child_b->date) ? 1 : -1;
+	}
+
+	return child_a->index - child_b->index;
+}
+
+static void
+flat_outlook_swap_message (MessageList *message_list,
+			   GNode *node_a,
+			   GNode *node_b)
+{
+	CamelMessageInfo *info_a, *info_b;
+	const gchar *uid_a, *uid_b;
+
+	info_a = node_a->data;
+	info_b = node_b->data;
+	if (!info_a || !info_b)
+		return;
+
+	uid_a = camel_message_info_get_uid (info_a);
+	uid_b = camel_message_info_get_uid (info_b);
+
+	node_a->data = info_b;
+	node_b->data = info_a;
+
+	g_hash_table_insert (message_list->uid_nodemap, (gpointer) uid_a, node_b);
+	g_hash_table_insert (message_list->uid_nodemap, (gpointer) uid_b, node_a);
+}
+
+static void
+flat_outlook_reorder_thread (MessageList *message_list,
+			     GNode *root)
+{
+	gboolean use_sent = FALSE;
+	gboolean newest_root = TRUE;
+	GNode *node, *best = NULL;
+	time_t best_date = 0;
+	GArray *children;
+	gint ii, index;
+
+	if (!root || !root->data || !root->children)
+		return;
+
+	flat_outlook_root_mode (message_list, &use_sent, &newest_root);
+
+	for (node = root; node; node = (node == root) ? root->children : node->next) {
+		time_t date;
+
+		if (!node->data)
+			continue;
+
+		date = flat_outlook_message_date (node->data, use_sent);
+		if (date <= 0)
+			continue;
+
+		if (!best ||
+		    (newest_root && date > best_date) ||
+		    (!newest_root && date < best_date)) {
+			best = node;
+			best_date = date;
+		}
+	}
+
+	if (best && best != root)
+		flat_outlook_swap_message (message_list, root, best);
+
+	/* One child is already the remaining message. */
+	if (!root->children->next)
+		return;
+
+	children = g_array_new (FALSE, FALSE, sizeof (FlatOutlookChild));
+	index = 0;
+	while (root->children) {
+		FlatOutlookChild child;
+
+		child.node = root->children;
+		child.date = flat_outlook_message_date (child.node->data, use_sent);
+		child.index = index++;
+		extended_g_node_unlink (child.node);
+		g_array_append_val (children, child);
+	}
+
+	if (children->len > 1) {
+		g_qsort_with_data (
+			children->data, children->len, sizeof (FlatOutlookChild),
+			flat_outlook_child_cmp, GINT_TO_POINTER (newest_root));
+	}
+
+	for (ii = 0; ii < (gint) children->len; ii++) {
+		FlatOutlookChild *child = &g_array_index (children, FlatOutlookChild, ii);
+
+		extended_g_node_insert (root, -1, child->node);
+	}
+
+	g_array_free (children, TRUE);
+}
+
 static void	build_subtree			(MessageList *message_list,
 						 GNode *parent,
 						 CamelFolderThreadNode *c,
 						 gboolean thread_flat,
+						 gboolean thread_flat_outlook,
 						 gboolean thread_latest,
 						 gint *row);
 
@@ -4894,6 +5146,7 @@ static void
 build_tree (MessageList *message_list,
             CamelFolderThread *thread,
 	    gboolean thread_flat,
+	    gboolean thread_flat_outlook,
 	    gboolean thread_latest,
             gboolean folder_changed)
 {
@@ -4931,6 +5184,7 @@ build_tree (MessageList *message_list,
 		message_list->priv->tree_model_root,
 		thread ? camel_folder_thread_get_tree (thread) : NULL,
 		thread_flat,
+		thread_flat_outlook,
 		thread_latest,
 		&row);
 
@@ -4957,6 +5211,7 @@ build_subtree (MessageList *message_list,
                GNode *parent,
                CamelFolderThreadNode *c,
 	       gboolean thread_flat,
+	       gboolean thread_flat_outlook,
 	       gboolean thread_latest,
                gint *row)
 {
@@ -4975,8 +5230,13 @@ build_subtree (MessageList *message_list,
 
 		if (camel_folder_thread_node_get_child (c)) {
 			build_subtree (message_list, (camel_folder_thread_node_get_parent (c) && thread_flat) ? parent : node,
-				camel_folder_thread_node_get_child (c), thread_flat, thread_latest, row);
+				camel_folder_thread_node_get_child (c), thread_flat, thread_flat_outlook, thread_latest, row);
 		}
+
+		if (thread_flat && thread_flat_outlook &&
+		    !camel_folder_thread_node_get_parent (c))
+			flat_outlook_reorder_thread (message_list, node);
+
 		c = camel_folder_thread_node_get_next (c);
 	}
 }
@@ -5624,6 +5884,35 @@ message_list_set_thread_flat (MessageList *message_list,
 	g_object_notify_by_pspec (G_OBJECT (message_list), properties[PROP_THREAD_FLAT]);
 
 	if (message_list->priv->group_by_threads) {
+		if (!message_list->frozen)
+			mail_regen_list (message_list, NULL, NULL);
+		else
+			message_list->priv->thaw_needs_regen = TRUE;
+	}
+}
+
+gboolean
+message_list_get_thread_flat_outlook (MessageList *message_list)
+{
+	g_return_val_if_fail (IS_MESSAGE_LIST (message_list), FALSE);
+
+	return message_list->priv->thread_flat_outlook;
+}
+
+void
+message_list_set_thread_flat_outlook (MessageList *message_list,
+				      gboolean thread_flat_outlook)
+{
+	g_return_if_fail (IS_MESSAGE_LIST (message_list));
+
+	if ((thread_flat_outlook ? 1 : 0) == (message_list->priv->thread_flat_outlook ? 1 : 0))
+		return;
+
+	message_list->priv->thread_flat_outlook = thread_flat_outlook;
+
+	g_object_notify_by_pspec (G_OBJECT (message_list), properties[PROP_THREAD_FLAT_OUTLOOK]);
+
+	if (message_list->priv->group_by_threads && message_list->priv->thread_flat) {
 		if (!message_list->frozen)
 			mail_regen_list (message_list, NULL, NULL);
 		else
@@ -6702,6 +6991,7 @@ message_list_regen_done_cb (GObject *source_object,
 			message_list,
 			regen_data->thread_tree,
 			regen_data->thread_flat,
+			regen_data->thread_flat_outlook,
 			regen_data->thread_latest,
 			regen_data->folder_changed);
 
@@ -6974,6 +7264,7 @@ message_list_regen_idle_cb (gpointer user_data)
 	regen_data->group_by_threads = message_list_get_group_by_threads (message_list);
 	regen_data->thread_subject = message_list_get_thread_subject (message_list);
 	regen_data->thread_flat = message_list_get_thread_flat (message_list);
+	regen_data->thread_flat_outlook = message_list_get_thread_flat_outlook (message_list);
 	regen_data->thread_latest = message_list_get_thread_latest (message_list);
 	regen_data->select_unread = message_list_get_regen_selects_unread (message_list);
 
