@@ -214,15 +214,19 @@ empe_mp_mixed_parse (EMailParserExtension *extension,
 
 		mail_part = g_queue_peek_head (&work_queue);
 
-		/* Display parts with CID as attachments
-		 * (unless they already are attachments).
-		 * Show also hidden attachments with CID,
-		 * because this is multipart/mixed,
-		 * not multipart/related. */
+		/* A Content-ID does not by itself make a file attachment.
+		 * Inline images and text stay in the message body and are
+		 * shown through cid: when the HTML refers to them. List the
+		 * part only when Camel treats it as an attachment, the same
+		 * rule as the message-list paperclip. */
 		if (mail_part != NULL &&
 		    e_mail_part_get_cid (mail_part) != NULL &&
 		    (!e_mail_part_get_is_attachment (mail_part) ||
-		     mail_part->is_hidden)) {
+		     mail_part->is_hidden) &&
+		    camel_content_disposition_is_attachment_ex (
+			camel_mime_part_get_content_disposition (subpart),
+			ct,
+			camel_mime_part_get_content_type (part))) {
 
 			e_mail_parser_wrap_as_attachment (parser, subpart, part_id, E_MAIL_PARSER_WRAP_ATTACHMENT_FLAG_NONE, &work_queue);
 

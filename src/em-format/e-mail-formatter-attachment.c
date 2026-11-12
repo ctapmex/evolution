@@ -99,6 +99,26 @@ emfe_attachment_format (EMailFormatterExtension *extension,
 			return TRUE;
 		}
 
+		/* The pinned bar already lists this file. Skip the duplicate
+		 * row inside the message. A force_inline part is the message
+		 * body itself, so it still has to be written here. With the
+		 * bar turned off, the row is the only way to open the file. */
+		if (!part->force_inline &&
+		    (context->mode == E_MAIL_FORMATTER_MODE_NORMAL ||
+		     context->mode == E_MAIL_FORMATTER_MODE_ALL_HEADERS)) {
+			GSettings *settings;
+			gboolean show_bar;
+
+			settings = e_util_ref_settings ("org.gnome.evolution.mail");
+			show_bar = g_settings_get_boolean (settings, "show-attachment-bar");
+			g_clear_object (&settings);
+
+			if (show_bar) {
+				g_object_unref (attachment);
+				return TRUE;
+			}
+		}
+
 		g_object_unref (attachment);
 	}
 
