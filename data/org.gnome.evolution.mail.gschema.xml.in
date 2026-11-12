@@ -416,6 +416,11 @@
       <_summary>Show photo of the sender</_summary>
       <_description>Show the photo of the sender in the message reading pane.</_description>
     </key>
+    <key name="pin-message-headers" type="b">
+      <default>true</default>
+      <_summary>Keep message headers visible while scrolling</_summary>
+      <_description>Keep the message header block visible at the top of the message preview while scrolling the message body.</_description>
+    </key>
     <key name="search-gravatar-for-photo" type="b">
       <default>false</default>
       <_summary>Search libravatar.org for photo of the sender</_summary>

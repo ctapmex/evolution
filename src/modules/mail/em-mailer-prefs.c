@@ -1999,6 +1999,7 @@ em_mailer_prefs_construct (EMMailerPrefs *prefs,
 	locked = !g_settings_is_writable (prefs->priv->settings, "headers");
 
 	em_prefs_bind_settings (prefs, settings, "show-sender-photo", "photo_show", "active");
+	em_prefs_bind_settings (prefs, settings, "pin-message-headers", "chkPinMessageHeaders", "active");
 	em_prefs_bind_settings (prefs, settings, "search-gravatar-for-photo", "search_gravatar", "active");
 	em_prefs_bind_settings_ex (prefs, settings, "show-sender-photo", "search_gravatar", "sensitive", G_SETTINGS_BIND_GET);
 	em_prefs_bind_settings (prefs, settings, "show-mails-in-preview", "chkShowMailsInPreview", "active");

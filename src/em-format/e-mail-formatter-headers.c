@@ -537,6 +537,7 @@ emfe_headers_format (EMailFormatterExtension *extension,
 	gboolean is_collapsable;
 	gboolean is_collapsed;
 	gboolean is_rfc822_headers;
+	gboolean pin_headers;
 
 	if (g_cancellable_is_cancelled (cancellable))
 		return FALSE;
@@ -572,6 +573,12 @@ emfe_headers_format (EMailFormatterExtension *extension,
 	is_collapsed = !is_rfc822_headers &&
 		(context->flags & E_MAIL_FORMATTER_HEADER_FLAG_COLLAPSED);
 
+	pin_headers = !is_rfc822_headers &&
+		context->mode != E_MAIL_FORMATTER_MODE_PRINTING &&
+		context->mode != E_MAIL_FORMATTER_MODE_SOURCE &&
+		e_mail_formatter_get_pin_message_headers (formatter) &&
+		g_strcmp0 (e_mail_part_get_id (part), ".message.headers") == 0;
+
 	buffer = g_string_new ("");
 
 	if (is_rfc822_headers) {
@@ -586,12 +593,14 @@ emfe_headers_format (EMailFormatterExtension *extension,
 	} else {
 		g_string_append_printf (
 			buffer,
-			"%s id=\"%s\"><table class=\"-e-mail-formatter-header-color\" border=\"0\" width=\"100%%\" "
+			"<div class=\"headers%s%s\"%s id=\"%s\"><table class=\"-e-mail-formatter-header-color\" border=\"0\" width=\"100%%\" "
 			"style=\"direction: %s; border-spacing: 0px\">"
 			"<tr>",
 			(context->mode != E_MAIL_FORMATTER_MODE_PRINTING) ?
-				"<div class=\"headers -e-mail-formatter-body-color\"" :
-				"<div class=\"headers\" style=\"background-color: #f7f7f7;\"",
+				" -e-mail-formatter-body-color" : "",
+			pin_headers ? " headers-pinned" : "",
+			(context->mode != E_MAIL_FORMATTER_MODE_PRINTING) ?
+				"" : " style=\"background-color: #f7f7f7;\"",
 			e_mail_part_get_id (part),
 			direction);
 	}

@@ -104,6 +104,14 @@ a.evo-awrap {
 
 /**** HEADERS ****/
 
+div.headers.headers-pinned {
+  position: sticky;
+  top: 0;
+  z-index: 2;
+  max-height: 40vh;
+  overflow-y: auto;
+}
+
 button.header-collapse {
   width: 18px;
   height: 18px;
