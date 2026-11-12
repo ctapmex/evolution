@@ -49,6 +49,9 @@ gboolean	e_mail_part_is_inline		(CamelMimePart *part,
 gboolean	e_mail_part_utils_body_refers	(const gchar *body,
 						 const gchar *cid);
 
+gchar *		e_mail_part_dup_cid_uri		(const gchar *uri);
+gchar *		e_mail_part_rewrite_cid_uris	(const gchar *html);
+
 CamelMimePart *	e_mail_part_utils_find_parent_part
 						(CamelMimeMessage *message,
 						 CamelMimePart *child);

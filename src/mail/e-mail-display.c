@@ -2535,6 +2535,32 @@ mail_display_uri_requested_cb (EWebView *web_view,
 	}
 }
 
+typedef struct _CidPartLookup {
+	const gchar *content_id;
+	CamelMimePart *part;
+} CidPartLookup;
+
+static gboolean
+camel_mime_part_from_cid_cb (CamelMimeMessage *message,
+			     CamelMimePart *part,
+			     CamelMimePart *parent_part,
+			     gpointer user_data)
+{
+	CidPartLookup *lookup = user_data;
+	const gchar *content_id;
+
+	(void) message;
+	(void) parent_part;
+
+	content_id = camel_mime_part_get_content_id (part);
+	if (content_id && g_ascii_strcasecmp (content_id, lookup->content_id) == 0) {
+		lookup->part = g_object_ref (part);
+		return FALSE;
+	}
+
+	return TRUE;
+}
+
 static CamelMimePart *
 camel_mime_part_from_cid (EMailDisplay *display,
                           const gchar *uri)
@@ -2542,20 +2568,37 @@ camel_mime_part_from_cid (EMailDisplay *display,
 	EMailPartList *part_list;
 	CamelMimeMessage *message;
 	CamelMimePart *mime_part;
+	gchar *cid_uri;
 
-	if (!g_str_has_prefix (uri, "cid:"))
+	cid_uri = e_mail_part_dup_cid_uri (uri);
+	if (!cid_uri)
 		return NULL;
 
 	part_list = e_mail_display_get_part_list (display);
-	if (!part_list)
+	if (!part_list) {
+		g_free (cid_uri);
 		return NULL;
+	}
 
 	message = e_mail_part_list_get_message (part_list);
-	if (!message)
+	if (!message) {
+		g_free (cid_uri);
 		return NULL;
+	}
 
 	mime_part = camel_mime_message_get_part_by_content_id (
-		message, uri + 4);
+		message, cid_uri + 4);
+
+	if (!mime_part) {
+		CidPartLookup lookup;
+
+		lookup.content_id = cid_uri + 4;
+		lookup.part = NULL;
+		camel_mime_message_foreach_part (message, camel_mime_part_from_cid_cb, &lookup);
+		mime_part = lookup.part;
+	}
+
+	g_free (cid_uri);
 
 	return mime_part;
 }
