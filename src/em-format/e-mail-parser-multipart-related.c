@@ -9,6 +9,7 @@
 #include <e-util/e-util.h>
 
 #include "e-mail-parser-extension.h"
+#include "e-mail-part-attachment.h"
 #include "e-mail-part-utils.h"
 #include "e-mail-part-image.h"
 
@@ -109,7 +110,6 @@ empe_mp_related_parse (EMailParserExtension *extension,
 	for (i = 0; i < nparts; i++) {
 		GQueue work_queue = G_QUEUE_INIT;
 		GList *head, *link;
-		gint subpart_index = 0;
 
 		body_part = camel_multipart_get_part (mp, i);
 
@@ -124,11 +124,17 @@ empe_mp_related_parse (EMailParserExtension *extension,
 
 		head = g_queue_peek_head_link (&work_queue);
 
-		for (link = head; link != NULL; link = g_list_next (link), subpart_index++) {
+		for (link = head; link != NULL; link = g_list_next (link)) {
 			EMailPart *mail_part = link->data;
 			gboolean can_be_attachment;
-			gboolean allow_as_attachment = FALSE;
+			gboolean real_attachment = FALSE;
 			const gchar *cid;
+
+			/* An attachment wrapper is the file listing itself.
+			 * Leave it visible; the image parser already created
+			 * it for a real Content-Disposition: attachment. */
+			if (E_IS_MAIL_PART_ATTACHMENT (mail_part))
+				continue;
 
 			cid = e_mail_part_get_cid (mail_part);
 			can_be_attachment = cid && E_IS_MAIL_PART_IMAGE (mail_part) &&
@@ -139,37 +145,20 @@ empe_mp_related_parse (EMailParserExtension *extension,
 
 				img_part = e_mail_part_ref_mime_part (mail_part);
 				if (img_part) {
-					CamelContentType *ct;
-
-					ct = camel_mime_part_get_content_type (img_part);
-					if (ct) {
-						const gchar *name = camel_content_type_param (ct, "name");
-
-						if (name && *name)
-							allow_as_attachment = TRUE;
-					}
-					g_clear_object (&img_part);
+					real_attachment = camel_content_disposition_is_attachment_ex (
+						camel_mime_part_get_content_disposition (img_part),
+						camel_mime_part_get_content_type (img_part),
+						camel_mime_part_get_content_type (part));
+					g_object_unref (img_part);
 				}
 			}
 
-			/* Don't render the part on its own! */
-			if (!allow_as_attachment && e_mail_part_utils_body_refers (html_body, cid))
+			/* The HTML already shows a referenced part. An inline
+			 * image is message content even when it has a file
+			 * name, so it is not offered as an attachment. */
+			if (e_mail_part_utils_body_refers (html_body, cid) ||
+			    (can_be_attachment && !real_attachment))
 				mail_part->is_hidden = TRUE;
-			else if (can_be_attachment) {
-				gint sub_partidlen;
-
-				sub_partidlen = part_id->len;
-				g_string_append_printf (part_id, ".subpart.%d", subpart_index);
-
-				if (allow_as_attachment && e_mail_part_utils_body_refers (html_body, cid))
-					mail_part->is_hidden = TRUE;
-
-				e_mail_parser_wrap_as_attachment (parser, body_part, part_id,
-					allow_as_attachment ? E_MAIL_PARSER_WRAP_ATTACHMENT_FLAG_IS_POSSIBLE : E_MAIL_PARSER_WRAP_ATTACHMENT_FLAG_NONE,
-					&work_queue);
-
-				g_string_truncate (part_id, sub_partidlen);
-			}
 		}
 
 		g_string_truncate (part_id, partidlen);

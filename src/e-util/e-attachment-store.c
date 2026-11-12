@@ -13,7 +13,6 @@
 #include "e-autoar-gtk-chooser.h"
 #endif
 
-#include "e-attachment-bar.h"
 #include "e-icon-factory.h"
 #include "e-misc-utils.h"
 #include "e-mktemp.h"
@@ -992,16 +991,13 @@ e_attachment_store_transform_num_attachments_to_visible_boolean (GBinding *bindi
 	g_return_val_if_fail (G_VALUE_HOLDS_UINT (from_value), FALSE);
 	g_return_val_if_fail (G_VALUE_HOLDS_BOOLEAN (to_value), FALSE);
 
+	/* Possible (inline) parts must not open an empty "0 attachments" bar. */
 	visible = g_value_get_uint (from_value) != 0;
 
-	if (!visible) {
-		GObject *target = g_binding_dup_target (binding);
-
-		if (E_IS_ATTACHMENT_BAR (target))
-			visible = e_attachment_bar_get_n_possible_attachments (E_ATTACHMENT_BAR (target)) > 0;
-	}
-
 	g_value_set_boolean (to_value, visible);
+
+	(void) binding;
+	(void) user_data;
 
 	return TRUE;
 }

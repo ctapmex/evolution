@@ -48,7 +48,13 @@ empe_image_parse (EMailParserExtension *extension,
 
 	g_queue_push_tail (&work_queue, mail_part);
 
-	if (!mail_part->is_hidden)
+	/* Inline images stay in the message. A Content-ID image is kept
+	 * hidden and shown from the HTML cid: reference. Only a part Camel
+	 * treats as a file attachment is listed in the attachment bar. */
+	if (camel_content_disposition_is_attachment_ex (
+		camel_mime_part_get_content_disposition (part),
+		camel_mime_part_get_content_type (part),
+		NULL))
 		e_mail_parser_wrap_as_attachment (parser, part, part_id, E_MAIL_PARSER_WRAP_ATTACHMENT_FLAG_NONE, &work_queue);
 
 	e_queue_transfer (&work_queue, out_mail_parts);
