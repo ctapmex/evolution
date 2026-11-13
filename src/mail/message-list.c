@@ -5430,10 +5430,10 @@ flat_outlook_swap_message (MessageList *message_list,
 
 static void
 flat_outlook_reorder_thread (MessageList *message_list,
-			     GNode *root)
+			     GNode *root,
+			     gboolean use_sent,
+			     gboolean newest_root)
 {
-	gboolean use_sent = FALSE;
-	gboolean newest_root = TRUE;
 	GNode *node, *best = NULL;
 	time_t best_date = 0;
 	GArray *children;
@@ -5441,8 +5441,6 @@ flat_outlook_reorder_thread (MessageList *message_list,
 
 	if (!root || !root->data || !root->children)
 		return;
-
-	flat_outlook_root_mode (message_list, &use_sent, &newest_root);
 
 	for (node = root; node; node = (node == root) ? root->children : node->next) {
 		time_t date;
@@ -5496,11 +5494,27 @@ flat_outlook_reorder_thread (MessageList *message_list,
 	g_array_free (children, TRUE);
 }
 
+static void
+flat_outlook_reorder_threads (MessageList *message_list,
+			      GNode *tree_root)
+{
+	gboolean use_sent = FALSE;
+	gboolean newest_root = TRUE;
+	GNode *node;
+
+	if (!tree_root)
+		return;
+
+	flat_outlook_root_mode (message_list, &use_sent, &newest_root);
+
+	for (node = tree_root->children; node; node = node->next)
+		flat_outlook_reorder_thread (message_list, node, use_sent, newest_root);
+}
+
 static void	build_subtree			(MessageList *message_list,
 						 GNode *parent,
 						 CamelFolderThreadNode *c,
 						 gboolean thread_flat,
-						 gboolean thread_flat_outlook,
 						 gboolean thread_latest,
 						 gint *row);
 
@@ -5546,9 +5560,11 @@ build_tree (MessageList *message_list,
 		message_list->priv->tree_model_root,
 		thread ? camel_folder_thread_get_tree (thread) : NULL,
 		thread_flat,
-		thread_flat_outlook,
 		thread_latest,
 		&row);
+
+	if (thread_flat && thread_flat_outlook)
+		flat_outlook_reorder_threads (message_list, message_list->priv->tree_model_root);
 
 	message_list_tree_model_thaw (message_list);
 
@@ -5573,7 +5589,6 @@ build_subtree (MessageList *message_list,
                GNode *parent,
                CamelFolderThreadNode *c,
 	       gboolean thread_flat,
-	       gboolean thread_flat_outlook,
 	       gboolean thread_latest,
                gint *row)
 {
@@ -5592,12 +5607,8 @@ build_subtree (MessageList *message_list,
 
 		if (camel_folder_thread_node_get_child (c)) {
 			build_subtree (message_list, (camel_folder_thread_node_get_parent (c) && thread_flat) ? parent : node,
-				camel_folder_thread_node_get_child (c), thread_flat, thread_flat_outlook, thread_latest, row);
+				camel_folder_thread_node_get_child (c), thread_flat, thread_latest, row);
 		}
-
-		if (thread_flat && thread_flat_outlook &&
-		    !camel_folder_thread_node_get_parent (c))
-			flat_outlook_reorder_thread (message_list, node);
 
 		c = camel_folder_thread_node_get_next (c);
 	}
