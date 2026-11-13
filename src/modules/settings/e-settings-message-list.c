@@ -73,6 +73,11 @@ settings_message_list_constructed (GObject *object)
 		message_list, "thread-flat-outlook",
 		G_SETTINGS_BIND_GET);
 
+	g_settings_bind (
+		settings, "thread-include-other-folders",
+		message_list, "thread-include-other-folders",
+		G_SETTINGS_BIND_GET);
+
 	/* This setting only controls the initial message list
 	 * state when in threaded mode, so just apply it here. */
 	message_list_set_expanded_default (

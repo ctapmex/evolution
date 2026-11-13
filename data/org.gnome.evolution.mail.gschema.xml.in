@@ -560,6 +560,11 @@
       <_summary>Order flat threads like Outlook</_summary>
       <_description>When flat threads are enabled, show the latest message as the thread root and list older messages below it, with the earliest message at the bottom. Sorting a date column ascending reverses that order.</_description>
     </key>
+    <key name="thread-include-other-folders" type="b">
+      <default>false</default>
+      <_summary>Show messages from other folders in threads</_summary>
+      <_description>When messages are grouped by thread, also show messages from other folders of the same account, and from the account Sent folder, that belong to a visible conversation. Those messages stay in their own folders.</_description>
+    </key>
     <key name="sort-accounts-alpha" type="b">
       <default>true</default>
       <_summary>Sort accounts alphabetically in a folder tree</_summary>

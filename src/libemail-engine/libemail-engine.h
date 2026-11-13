@@ -15,6 +15,7 @@
 #include <libemail-engine/e-mail-session.h>
 #include <libemail-engine/e-mail-session-utils.h>
 #include <libemail-engine/e-mail-store-utils.h>
+#include <libemail-engine/e-mail-conversation-index.h>
 #include <libemail-engine/e-mail-utils.h>
 #include <libemail-engine/em-filter-folder-element.h>
 #include <libemail-engine/em-vfolder-context.h>

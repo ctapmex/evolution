@@ -187,6 +187,18 @@ gboolean	message_list_get_thread_flat_outlook
 void		message_list_set_thread_flat_outlook
 						(MessageList *message_list,
 						 gboolean thread_flat_outlook);
+gboolean	message_list_get_thread_include_other_folders
+						(MessageList *message_list);
+void		message_list_set_thread_include_other_folders
+						(MessageList *message_list,
+						 gboolean include);
+gboolean	message_list_resolve_uid	(MessageList *message_list,
+						 const gchar *uid,
+						 CamelFolder **out_folder,
+						 gchar **out_real_uid);
+CamelMessageInfo *
+		message_list_ref_message_info	(MessageList *message_list,
+						 const gchar *uid);
 gboolean	message_list_get_regen_selects_unread
 						(MessageList *message_list);
 void		message_list_set_regen_selects_unread

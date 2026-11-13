@@ -7,6 +7,7 @@ set(DEPENDENCIES
 
 set(SOURCES
 	camel-null-store.c
+	e-mail-conversation-index.c
 	e-mail-folder-utils.c
 	e-mail-junk-filter.c
 	e-mail-session-utils.c
@@ -29,6 +30,7 @@ set(HEADERS
 	libemail-engine.h
 	camel-null-store.h
 	e-mail-engine-enums.h
+	e-mail-conversation-index.h
 	e-mail-folder-utils.h
 	e-mail-junk-filter.h
 	e-mail-session-utils.h

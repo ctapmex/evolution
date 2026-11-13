@@ -21,6 +21,7 @@
 
 #include "mail/e-mail-browser.h"
 #include "mail/e-mail-reader.h"
+#include "mail/e-mail-reader-utils.h"
 #include "mail/e-mail-view.h"
 #include "mail/em-composer-utils.h"
 #include "mail/em-config.h"
@@ -321,9 +322,10 @@ emla_list_action (EMailReader *reader,
 	EActivity *activity;
 	AsyncContext *context;
 	GCancellable *cancellable;
-	CamelFolder *folder;
+	CamelFolder *folder = NULL;
 	GPtrArray *uids;
 	const gchar *message_uid;
+	gchar *real_uid = NULL;
 
 	uids = e_mail_reader_get_selected_uids (reader);
 	g_return_if_fail (uids != NULL && uids->len == 1);
@@ -332,20 +334,25 @@ emla_list_action (EMailReader *reader,
 	activity = e_mail_reader_new_activity (reader);
 	cancellable = e_activity_get_cancellable (activity);
 
+	if (!e_mail_reader_resolve_uid (reader, message_uid, &folder, &real_uid)) {
+		g_object_unref (activity);
+		g_ptr_array_unref (uids);
+		return;
+	}
+
 	context = g_slice_new0 (AsyncContext);
 	context->activity = activity;
 	context->reader = g_object_ref (reader);
 	context->action = action;
-	context->message_uid = camel_pstring_strdup (message_uid);
-
-	folder = e_mail_reader_ref_folder (reader);
+	context->message_uid = camel_pstring_strdup (real_uid);
 
 	camel_folder_get_message (
-		folder, message_uid, G_PRIORITY_DEFAULT,
+		folder, real_uid, G_PRIORITY_DEFAULT,
 		cancellable, (GAsyncReadyCallback)
 		emla_list_action_cb, context);
 
 	g_clear_object (&folder);
+	g_free (real_uid);
 
 	g_ptr_array_unref (uids);
 }

@@ -39,12 +39,105 @@
 #include "em-folder-selector.h"
 
 #include "em-utils.h"
+#include "e-mail-reader-utils.h"
 
 /* How many is too many? */
 /* Used in em_util_ask_open_many() */
 #define TOO_MANY 10
 
 #define d(x)
+
+/* Same encoding as MessageList's foreign row key. Kept here so drag and
+ * clipboard code can recover the real folder without including message-list.h. */
+#define EM_FOREIGN_UID_PREFIX "\001evo-xfld\001"
+
+static gboolean
+em_utils_foreign_uid_folder (CamelFolder *view_folder,
+			     const gchar *uid,
+			     CamelFolder **out_folder,
+			     const gchar **out_real_uid)
+{
+	const gchar *rest, *sep_store, *sep_folder;
+	gchar *store_uid;
+	gchar *folder_name;
+	CamelStore *view_store;
+	CamelSession *session;
+	CamelService *service;
+	CamelFolder *folder;
+
+	if (out_folder != NULL)
+		*out_folder = NULL;
+
+	if (uid == NULL || view_folder == NULL ||
+	    !g_str_has_prefix (uid, EM_FOREIGN_UID_PREFIX))
+		return FALSE;
+
+	rest = uid + strlen (EM_FOREIGN_UID_PREFIX);
+	sep_store = strchr (rest, '\001');
+	if (sep_store == NULL || sep_store == rest)
+		return FALSE;
+
+	sep_folder = strchr (sep_store + 1, '\001');
+	if (sep_folder == NULL || sep_folder == sep_store + 1 || sep_folder[1] == '\0')
+		return FALSE;
+
+	store_uid = g_strndup (rest, sep_store - rest);
+	folder_name = g_strndup (sep_store + 1, sep_folder - (sep_store + 1));
+
+	view_store = camel_folder_get_parent_store (view_folder);
+	session = camel_service_ref_session (CAMEL_SERVICE (view_store));
+	service = camel_session_ref_service (session, store_uid);
+	g_object_unref (session);
+	g_free (store_uid);
+
+	if (!CAMEL_IS_STORE (service)) {
+		g_clear_object (&service);
+		g_free (folder_name);
+		return FALSE;
+	}
+
+	folder = camel_store_get_folder_sync (
+		CAMEL_STORE (service), folder_name, 0, NULL, NULL);
+	g_object_unref (service);
+	g_free (folder_name);
+
+	if (folder == NULL)
+		return FALSE;
+
+	if (out_folder != NULL)
+		*out_folder = folder;
+	else
+		g_object_unref (folder);
+
+	if (out_real_uid != NULL)
+		*out_real_uid = sep_folder + 1;
+
+	return TRUE;
+}
+
+static CamelMessageInfo *
+em_utils_ref_info (EMailReader *reader,
+		   CamelFolder *folder,
+		   const gchar *uid)
+{
+	CamelMessageInfo *info = NULL;
+	CamelFolder *real_folder = NULL;
+	const gchar *real_uid = NULL;
+
+	if (reader != NULL)
+		info = e_mail_reader_ref_message_info (reader, uid);
+
+	if (info == NULL && folder != NULL)
+		info = camel_folder_get_message_info (folder, uid);
+
+	if (info == NULL &&
+	    em_utils_foreign_uid_folder (folder, uid, &real_folder, &real_uid)) {
+		info = camel_folder_get_message_info (real_folder, real_uid);
+		g_object_unref (real_folder);
+	}
+
+	return info;
+}
 
 gboolean
 em_utils_ask_open_many (GtkWindow *parent,
@@ -207,7 +300,7 @@ em_utils_flag_for_followup (EMailReader *reader,
 	for (ii = 0; ii < uids->len; ii++) {
 		CamelMessageInfo *info;
 
-		info = camel_folder_get_message_info (folder, uids->pdata[ii]);
+		info = em_utils_ref_info (reader, folder, uids->pdata[ii]);
 
 		if (info == NULL)
 			continue;
@@ -226,7 +319,7 @@ em_utils_flag_for_followup (EMailReader *reader,
 		const gchar *message_uid;
 
 		message_uid = g_ptr_array_index (uids, 0);
-		info = camel_folder_get_message_info (folder, message_uid);
+		info = em_utils_ref_info (reader, folder, message_uid);
 		if (info) {
 			tags = camel_message_info_dup_user_tags (info);
 
@@ -257,7 +350,7 @@ em_utils_flag_for_followup (EMailReader *reader,
 		CamelMessageInfo *info;
 		guint jj;
 
-		info = camel_folder_get_message_info (folder, uids->pdata[ii]);
+		info = em_utils_ref_info (reader, folder, uids->pdata[ii]);
 
 		if (info == NULL)
 			continue;
@@ -312,7 +405,7 @@ em_utils_flag_for_followup_clear (GtkWindow *parent,
 
 	camel_folder_freeze (folder);
 	for (i = 0; i < uids->len; i++) {
-		CamelMessageInfo *mi = camel_folder_get_message_info (folder, uids->pdata[i]);
+		CamelMessageInfo *mi = em_utils_ref_info (NULL, folder, uids->pdata[i]);
 
 		if (mi) {
 			camel_message_info_freeze_notifications (mi);
@@ -354,7 +447,7 @@ em_utils_flag_for_followup_completed (GtkWindow *parent,
 	camel_folder_freeze (folder);
 	for (i = 0; i < uids->len; i++) {
 		const gchar *tag;
-		CamelMessageInfo *mi = camel_folder_get_message_info (folder, uids->pdata[i]);
+		CamelMessageInfo *mi = em_utils_ref_info (NULL, folder, uids->pdata[i]);
 
 		if (mi) {
 			tag = camel_message_info_get_user_tag (mi, "follow-up");
@@ -390,10 +483,17 @@ em_utils_write_messages_to_stream (CamelFolder *folder,
 
 	for (i = 0; i < uids->len; i++) {
 		CamelMimeMessage *message;
+		CamelFolder *src_folder = folder;
+		CamelFolder *foreign_folder = NULL;
+		const gchar *real_uid = uids->pdata[i];
+
+		if (em_utils_foreign_uid_folder (folder, real_uid, &foreign_folder, &real_uid))
+			src_folder = foreign_folder;
 
 		/* FIXME camel_folder_get_message_sync() may block. */
 		message = camel_folder_get_message_sync (
-			folder, uids->pdata[i], NULL, NULL);
+			src_folder, real_uid, NULL, NULL);
+		g_clear_object (&foreign_folder);
 		if (message == NULL) {
 			res = -1;
 			break;
@@ -440,11 +540,24 @@ em_utils_print_messages_to_file (CamelFolder *folder,
 	CamelMimeMessage *message;
 	CamelStore *parent_store;
 	CamelSession *session;
+	CamelFolder *foreign_folder = NULL;
 	gboolean success = FALSE;
 
-	message = camel_folder_get_message_sync (folder, uid, NULL, NULL);
-	if (message == NULL)
+	{
+		const gchar *real_uid = NULL;
+
+		if (em_utils_foreign_uid_folder (folder, uid, &foreign_folder, &real_uid)) {
+			message = camel_folder_get_message_sync (foreign_folder, real_uid, NULL, NULL);
+			uid = real_uid;
+			folder = foreign_folder;
+		} else {
+			message = camel_folder_get_message_sync (folder, uid, NULL, NULL);
+		}
+	}
+	if (message == NULL) {
+		g_clear_object (&foreign_folder);
 		return FALSE;
+	}
 
 	parent_store = camel_folder_get_parent_store (folder);
 	session = camel_service_ref_session (CAMEL_SERVICE (parent_store));
@@ -456,6 +569,7 @@ em_utils_print_messages_to_file (CamelFolder *folder,
 	 *     That means potentially blocking for awhile. */
 	parts_list = e_mail_parser_parse_sync (
 		parser, folder, uid, message, NULL);
+	g_clear_object (&foreign_folder);
 	if (parts_list != NULL) {
 		EMailBackend *mail_backend;
 		EAsyncClosure *closure;
@@ -665,8 +779,24 @@ em_utils_selection_set_uidlist (GtkSelectionData *selection_data,
 		folder_uri = e_mail_folder_uri_from_folder (folder);
 
 		for (ii = 0; ii < uids->len; ii++) {
-			g_byte_array_append (array, (guchar *) folder_uri, strlen (folder_uri) + 1);
-			g_byte_array_append (array, uids->pdata[ii], strlen (uids->pdata[ii]) + 1);
+			CamelFolder *foreign_folder = NULL;
+			const gchar *real_uid = NULL;
+			gchar *uri = NULL;
+
+			if (em_utils_foreign_uid_folder (
+				folder, uids->pdata[ii], &foreign_folder, &real_uid))
+				uri = e_mail_folder_uri_from_folder (foreign_folder);
+
+			if (uri != NULL && real_uid != NULL) {
+				g_byte_array_append (array, (guchar *) uri, strlen (uri) + 1);
+				g_byte_array_append (array, (guchar *) real_uid, strlen (real_uid) + 1);
+			} else {
+				g_byte_array_append (array, (guchar *) folder_uri, strlen (folder_uri) + 1);
+				g_byte_array_append (array, uids->pdata[ii], strlen (uids->pdata[ii]) + 1);
+			}
+
+			g_free (uri);
+			g_clear_object (&foreign_folder);
 		}
 
 		g_free (folder_uri);
@@ -889,7 +1019,7 @@ em_utils_build_export_basename (CamelFolder *folder,
 	g_return_val_if_fail (uid != NULL, NULL);
 
 	/* Try to get the drop filename from the message or folder. */
-	info = camel_folder_get_message_info (folder, uid);
+	info = em_utils_ref_info (NULL, folder, uid);
 	if (info != NULL) {
 		subject = camel_message_info_get_subject (info);
 		reftime = camel_message_info_get_date_sent (info);

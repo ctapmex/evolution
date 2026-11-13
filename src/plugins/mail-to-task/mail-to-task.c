@@ -20,6 +20,7 @@
 
 #include "mail/e-mail-browser.h"
 #include "mail/e-mail-view.h"
+#include "mail/e-mail-reader-utils.h"
 #include "mail/em-utils.h"
 #include "mail/message-list.h"
 
@@ -842,6 +843,7 @@ typedef struct {
 	ECalClientSourceType source_type;
 	CamelFolder *folder;
 	GPtrArray *uids;
+	GPtrArray *folders; /* CamelFolder * of each uid */
 	gchar *selected_text;
 	gchar *default_charset;
 	gchar *forced_charset;
@@ -855,6 +857,7 @@ async_data_free (AsyncData *data)
 		g_free (data->selected_text);
 		g_free (data->default_charset);
 		g_free (data->forced_charset);
+		g_clear_pointer (&data->folders, g_ptr_array_unref);
 		g_object_unref (data->client_cache);
 		g_object_unref (data->source);
 		g_slice_free (AsyncData, data);
@@ -963,10 +966,11 @@ do_mail_to_event (AsyncData *data)
 			ICalComponent *icomp;
 			struct _manage_comp *mc;
 			const gchar *message_uid = g_ptr_array_index (uids, i);
+			CamelFolder *message_folder = data->folders ? data->folders->pdata[i] : folder;
 
 			/* retrieve the message from the CamelFolder */
 			/* FIXME Not passing a GCancellable or GError. */
-			message = camel_folder_get_message_sync (folder, message_uid, NULL, NULL);
+			message = camel_folder_get_message_sync (message_folder, message_uid, NULL, NULL);
 			if (!message) {
 				continue;
 			}
@@ -1015,7 +1019,7 @@ do_mail_to_event (AsyncData *data)
 				gchar *organizer;
 
 				/* set actual user as organizer, to be able to change event's properties */
-				organizer = set_organizer (comp, message, data->folder, message_uid);
+				organizer = set_organizer (comp, message, message_folder, message_uid);
 				set_attendees (comp, message, organizer);
 				g_free (organizer);
 			}
@@ -1300,7 +1304,11 @@ mail_to_event (ECalClientSourceType source_type,
 		data->extension_name = extension_name;
 		data->source_type = source_type;
 		data->folder = e_mail_reader_ref_folder (reader);
-		data->uids = g_ptr_array_ref (uids);
+		if (!e_mail_reader_resolve_uids (reader, uids, &data->folders, &data->uids)) {
+			g_clear_pointer (&data->folders, g_ptr_array_unref);
+			g_clear_pointer (&data->uids, g_ptr_array_unref);
+			data->uids = g_ptr_array_ref (uids);
+		}
 		data->with_attendees = with_attendees;
 		get_charsets (reader, &data->default_charset, &data->forced_charset);
 

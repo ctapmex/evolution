@@ -25,6 +25,7 @@ struct _AsyncContext {
 	CamelMimeMessage *message;
 	CamelMessageInfo *info;
 	GPtrArray *ptr_array;
+	GPtrArray *folders;
 	GFile *destination;
 };
 
@@ -37,6 +38,7 @@ static void
 async_context_free (AsyncContext *context)
 {
 	g_clear_pointer (&context->ptr_array, g_ptr_array_unref);
+	g_clear_pointer (&context->folders, g_ptr_array_unref);
 	g_clear_object (&context->message);
 	g_clear_object (&context->info);
 	g_clear_object (&context->destination);
@@ -1447,6 +1449,13 @@ e_mail_folder_remove_attachments_finish (CamelFolder *folder,
 	return g_task_propagate_boolean (G_TASK (result), error);
 }
 
+static gboolean	mail_folder_save_messages_impl	(CamelFolder *folder,
+						 GPtrArray *folders,
+						 GPtrArray *message_uids,
+						 GFile *destination,
+						 GCancellable *cancellable,
+						 GError **error);
+
 static void
 mail_folder_save_messages_thread (GTask *task,
                                   gpointer source_object,
@@ -1459,8 +1468,8 @@ mail_folder_save_messages_thread (GTask *task,
 
 	context = task_data;
 
-	res = e_mail_folder_save_messages_sync (
-		CAMEL_FOLDER (source_object), context->ptr_array,
+	res = mail_folder_save_messages_impl (
+		CAMEL_FOLDER (source_object), context->folders, context->ptr_array,
 		context->destination, cancellable, &error);
 
 	if (error != NULL)
@@ -1557,6 +1566,19 @@ e_mail_folder_save_messages_sync (CamelFolder *folder,
                                   GCancellable *cancellable,
                                   GError **error)
 {
+	return mail_folder_save_messages_impl (
+		folder, NULL, message_uids, destination, cancellable, error);
+}
+
+/* @folders, when not NULL, holds the folder of each UID. */
+static gboolean
+mail_folder_save_messages_impl (CamelFolder *folder,
+                                GPtrArray *folders,
+                                GPtrArray *message_uids,
+                                GFile *destination,
+                                GCancellable *cancellable,
+                                GError **error)
+{
 	GFileOutputStream *file_output_stream;
 	CamelStream *base_stream = NULL;
 	GByteArray *byte_array;
@@ -1566,6 +1588,7 @@ e_mail_folder_save_messages_sync (CamelFolder *folder,
 
 	g_return_val_if_fail (CAMEL_IS_FOLDER (folder), FALSE);
 	g_return_val_if_fail (message_uids != NULL, FALSE);
+	g_return_val_if_fail (folders == NULL || folders->len == message_uids->len, FALSE);
 	g_return_val_if_fail (G_IS_FILE (destination), FALSE);
 
 	/* Need at least one message UID to save. */
@@ -1601,6 +1624,7 @@ e_mail_folder_save_messages_sync (CamelFolder *folder,
 
 	for (ii = 0; ii < message_uids->len; ii++) {
 		CamelMimeMessage *message;
+		CamelFolder *message_folder;
 		const gchar *uid;
 		gchar *filename;
 		GFileInputStream *file_input_stream = NULL;
@@ -1619,14 +1643,15 @@ e_mail_folder_save_messages_sync (CamelFolder *folder,
 			CAMEL_STREAM_MEM (base_stream), byte_array);
 
 		uid = g_ptr_array_index (message_uids, ii);
+		message_folder = folders != NULL ? folders->pdata[ii] : folder;
 
-		message = camel_folder_get_message_sync (folder, uid, cancellable, error);
+		message = camel_folder_get_message_sync (message_folder, uid, cancellable, error);
 		if (message == NULL) {
 			success = FALSE;
 			goto exit;
 		}
 
-		filename = camel_folder_get_filename (folder, uid, NULL);
+		filename = camel_folder_get_filename (message_folder, uid, NULL);
 		if (filename) {
 			GFile *file;
 
@@ -1759,6 +1784,56 @@ e_mail_folder_save_messages (CamelFolder *folder,
 	context->destination = g_object_ref (destination);
 
 	task = g_task_new (folder, cancellable, callback, user_data);
+	g_task_set_source_tag (task, e_mail_folder_save_messages);
+	g_task_set_priority (task, io_priority);
+	g_task_set_task_data (task, g_steal_pointer (&context), (GDestroyNotify) async_context_free);
+
+	g_task_run_in_thread (task, mail_folder_save_messages_thread);
+
+	g_object_unref (task);
+}
+
+/**
+ * e_mail_folder_save_messages_from_folders:
+ * @folders: (element-type CamelFolder): the folder of each message
+ * @message_uids: (element-type utf8): message UIDs, one per folder
+ * @destination: a #GFile
+ * @io_priority: the I/O priority of the request
+ * @cancellable: optional #GCancellable object, or %NULL
+ * @callback: a #GAsyncReadyCallback to call when the request is satisfied
+ * @user_data: data to pass to the callback function
+ *
+ * Like e_mail_folder_save_messages(), for messages that live in different
+ * folders. Messages are written in the order of @message_uids. The source
+ * object of the result is the first folder; finish the request with
+ * e_mail_folder_save_messages_finish().
+ **/
+void
+e_mail_folder_save_messages_from_folders (GPtrArray *folders,
+                                          GPtrArray *message_uids,
+                                          GFile *destination,
+                                          gint io_priority,
+                                          GCancellable *cancellable,
+                                          GAsyncReadyCallback callback,
+                                          gpointer user_data)
+{
+	GTask *task;
+	AsyncContext *context;
+
+	g_return_if_fail (folders != NULL);
+	g_return_if_fail (message_uids != NULL);
+	g_return_if_fail (folders->len == message_uids->len);
+	g_return_if_fail (G_IS_FILE (destination));
+
+	/* Need at least one message UID to save. */
+	g_return_if_fail (message_uids->len > 0);
+
+	context = g_slice_new0 (AsyncContext);
+	context->ptr_array = g_ptr_array_ref (message_uids);
+	context->folders = g_ptr_array_ref (folders);
+	context->destination = g_object_ref (destination);
+
+	task = g_task_new (folders->pdata[0], cancellable, callback, user_data);
 	g_task_set_source_tag (task, e_mail_folder_save_messages);
 	g_task_set_priority (task, io_priority);
 	g_task_set_task_data (task, g_steal_pointer (&context), (GDestroyNotify) async_context_free);

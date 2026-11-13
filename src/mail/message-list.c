@@ -90,6 +90,14 @@ struct _MessageListPrivate {
 	gboolean thread_compress;
 	gboolean thread_flat;
 	gboolean thread_flat_outlook;
+	gboolean thread_include_other_folders;
+	GHashTable *foreign_nodemap; /* owned key -> GNode */
+	GHashTable *node_keys; /* GNode * -> owned key, not freed here */
+	GPtrArray *foreign_folders; /* CamelFolder * */
+	GHashTable *foreign_subjects; /* CamelMessageInfo * -> decorated subject */
+	GHashTable *foreign_subjects_trimmed;
+	gulong folder_cache_changed_id;
+	gboolean other_folders_regen_pending;
 	gboolean any_row_changed; /* save state before regen list when this is set to true */
 	gboolean regen_selects_unread;
 
@@ -145,10 +153,12 @@ struct _RegenData {
 	gboolean thread_subject;
 	gboolean thread_flat;
 	gboolean thread_flat_outlook;
+	gboolean thread_include_other_folders;
 	gboolean thread_latest;
 	gboolean select_unread;
 
 	CamelFolderThread *thread_tree;
+	GPtrArray *extra_folders; /* CamelFolder *, kept alive with the infos */
 
 	/* This indicates we're regenerating the message list because
 	 * we received a "folder-changed" signal from our CamelFolder. */
@@ -183,6 +193,7 @@ enum {
 	PROP_THREAD_COMPRESS,
 	PROP_THREAD_FLAT,
 	PROP_THREAD_FLAT_OUTLOOK,
+	PROP_THREAD_INCLUDE_OTHER_FOLDERS,
 	N_PROPS,
 	PROP_COPY_TARGET_LIST,
 	PROP_PASTE_TARGET_LIST
@@ -198,6 +209,14 @@ static void	message_list_tree_model_init
 static gboolean	message_list_get_hide_deleted
 					(MessageList *message_list,
 					 CamelFolder *folder);
+static void	mail_regen_list		(MessageList *message_list,
+					 const gchar *search,
+					 CamelFolderChangeInfo *changes);
+
+/* List key for a message that lives in another folder. The bytes are
+ * store-uid, folder full name and the real UID, split by 0x01. */
+#define ML_FOREIGN_UID_PREFIX "\001evo-xfld\001"
+#define ML_FOREIGN_BULK_FETCH 200
 
 G_DEFINE_TYPE_WITH_CODE (MessageList, message_list, E_TYPE_TREE,
 	G_ADD_PRIVATE (MessageList)
@@ -511,6 +530,7 @@ regen_data_free (RegenData *regen_data)
 
 	g_clear_pointer (&regen_data->search, g_free);
 	g_clear_object (&regen_data->thread_tree);
+	g_clear_pointer (&regen_data->extra_folders, g_ptr_array_unref);
 
 	if (regen_data->summary != NULL) {
 		guint ii, length;
@@ -671,15 +691,126 @@ filter_size (gint size)
 	}
 }
 
-/* Gets the uid of the message displayed at a given view row */
+static GNode *
+ml_uid_node (MessageList *message_list,
+             const gchar *uid)
+{
+	GNode *node;
+
+	if (uid == NULL)
+		return NULL;
+
+	node = g_hash_table_lookup (message_list->uid_nodemap, uid);
+	if (node != NULL)
+		return node;
+
+	if (message_list->priv->foreign_nodemap == NULL)
+		return NULL;
+
+	return g_hash_table_lookup (message_list->priv->foreign_nodemap, uid);
+}
+
+/* Gets the uid of the message displayed at a given view row.
+ * For a message from another folder this is the list key, not the
+ * UID inside that folder. */
 static const gchar *
 get_message_uid (MessageList *message_list,
                  GNode *node)
 {
+	const gchar *key;
+
 	g_return_val_if_fail (node != NULL, NULL);
 	g_return_val_if_fail (node->data != NULL, NULL);
 
+	key = g_hash_table_lookup (message_list->priv->node_keys, node);
+	if (key != NULL)
+		return key;
+
 	return camel_message_info_get_uid (node->data);
+}
+
+static CamelFolder *
+ml_info_folder (CamelMessageInfo *info)
+{
+	CamelFolderSummary *summary;
+	CamelFolder *folder;
+
+	if (info == NULL)
+		return NULL;
+
+	summary = camel_message_info_ref_summary (info);
+	if (summary == NULL)
+		return NULL;
+
+	folder = camel_folder_summary_get_folder (summary);
+	g_object_unref (summary);
+
+	return folder;
+}
+
+static void
+ml_remember_folder (MessageList *message_list,
+                    CamelFolder *folder)
+{
+	guint ii;
+
+	if (folder == NULL || folder == message_list->priv->folder)
+		return;
+
+	for (ii = 0; ii < message_list->priv->foreign_folders->len; ii++) {
+		if (message_list->priv->foreign_folders->pdata[ii] == folder)
+			return;
+	}
+
+	g_ptr_array_add (message_list->priv->foreign_folders, g_object_ref (folder));
+}
+
+static const gchar *
+ml_foreign_folder_name (MessageList *message_list,
+                        CamelMessageInfo *info)
+{
+	CamelFolder *folder;
+	const gchar *name;
+
+	folder = ml_info_folder (info);
+	if (folder == NULL || folder == message_list->priv->folder)
+		return NULL;
+
+	name = camel_folder_get_display_name (folder);
+	if (name == NULL || name[0] == '\0')
+		name = camel_folder_get_full_name (folder);
+
+	return name;
+}
+
+static const gchar *
+ml_decorate_subject (MessageList *message_list,
+                     CamelMessageInfo *info,
+                     const gchar *subject,
+                     gboolean trimmed)
+{
+	GHashTable *cache;
+	const gchar *name;
+	gchar *decorated;
+
+	if (subject == NULL)
+		subject = "";
+
+	name = ml_foreign_folder_name (message_list, info);
+	if (name == NULL)
+		return subject;
+
+	cache = trimmed ?
+		message_list->priv->foreign_subjects_trimmed :
+		message_list->priv->foreign_subjects;
+	decorated = g_hash_table_lookup (cache, info);
+	if (decorated != NULL)
+		return decorated;
+
+	decorated = g_strdup_printf ("%s · %s", subject, name);
+	g_hash_table_insert (cache, info, decorated);
+
+	return decorated;
 }
 
 /* Gets the CamelMessageInfo for the message displayed at the given
@@ -728,11 +859,28 @@ get_normalised_string (MessageList *message_list,
 	if (string == NULL || string[0] == '\0')
 		return "";
 
-	poolv = g_hash_table_lookup (message_list->normalised_hash, camel_message_info_get_uid (info));
-	if (poolv == NULL) {
-		poolv = e_poolv_new (NORMALISED_LAST);
-		g_hash_table_insert (message_list->normalised_hash, (gchar *) camel_message_info_get_uid (info), poolv);
-	} else {
+	{
+		const gchar *norm_key = camel_message_info_get_uid (info);
+		gchar *foreign_key = NULL;
+
+		/* Same UID in two folders must not share one cache entry. */
+		if (ml_info_folder (info) != message_list->priv->folder) {
+			foreign_key = g_strdup_printf ("%p", (gpointer) info);
+			norm_key = foreign_key;
+		}
+
+		poolv = g_hash_table_lookup (message_list->normalised_hash, norm_key);
+		if (poolv == NULL) {
+			poolv = e_poolv_new (NORMALISED_LAST);
+			g_hash_table_insert (
+				message_list->normalised_hash,
+				foreign_key ? foreign_key : (gchar *) norm_key,
+				poolv);
+			foreign_key = NULL;
+		}
+		g_free (foreign_key);
+	}
+	if (poolv != NULL) {
 		str = e_poolv_get (poolv, index);
 		if (*str)
 			return str;
@@ -988,8 +1136,8 @@ ml_search_path (MessageList *message_list,
 	if (message_list->cursor_uid == NULL)
 		return NULL;
 
-	node = g_hash_table_lookup (
-		message_list->uid_nodemap,
+	node = ml_uid_node (
+		message_list,
 		message_list->cursor_uid);
 	if (node == NULL)
 		return NULL;
@@ -1133,7 +1281,7 @@ message_list_select_uid (MessageList *message_list,
 
 	/* Try to find the requested message UID. */
 	if (uid != NULL)
-		node = g_hash_table_lookup (uid_nodemap, uid);
+		node = ml_uid_node (message_list, uid);
 
 	g_mutex_lock (&message_list->priv->regen_lock);
 
@@ -1155,11 +1303,11 @@ message_list_select_uid (MessageList *message_list,
 
 	} else if (with_fallback) {
 		if (node == NULL && priv->oldest_unread_uid != NULL)
-			node = g_hash_table_lookup (
-				uid_nodemap, priv->oldest_unread_uid);
+			node = ml_uid_node (
+				message_list, priv->oldest_unread_uid);
 		if (node == NULL && priv->newest_read_uid != NULL)
-			node = g_hash_table_lookup (
-				uid_nodemap, priv->newest_read_uid);
+			node = ml_uid_node (
+				message_list, priv->newest_read_uid);
 	}
 
 	g_mutex_unlock (&message_list->priv->regen_lock);
@@ -1209,8 +1357,8 @@ message_list_select_next_thread (MessageList *message_list)
 	if (message_list->cursor_uid == NULL)
 		return;
 
-	node = g_hash_table_lookup (
-		message_list->uid_nodemap,
+	node = ml_uid_node (
+		message_list,
 		message_list->cursor_uid);
 	if (node == NULL)
 		return;
@@ -1246,8 +1394,8 @@ message_list_select_prev_thread (MessageList *message_list)
 	if (message_list->cursor_uid == NULL)
 		return;
 
-	node = g_hash_table_lookup (
-		message_list->uid_nodemap,
+	node = ml_uid_node (
+		message_list,
 		message_list->cursor_uid);
 	if (node == NULL)
 		return;
@@ -1426,24 +1574,26 @@ message_list_copy (MessageList *message_list,
 
 	if (uids->len > 0) {
 		if (cut) {
-			CamelFolder *folder;
 			gint i;
 
-			folder = message_list_ref_folder (message_list);
+			for (i = 0; i < uids->len; i++) {
+				CamelFolder *folder = NULL;
+				gchar *real_uid = NULL;
 
-			camel_folder_freeze (folder);
+				if (!message_list_resolve_uid (
+					message_list, uids->pdata[i], &folder, &real_uid))
+					continue;
 
-			for (i = 0; i < uids->len; i++)
 				camel_folder_set_message_flags (
-					folder, uids->pdata[i],
+					folder, real_uid,
 					CAMEL_MESSAGE_SEEN |
 					CAMEL_MESSAGE_DELETED,
 					CAMEL_MESSAGE_SEEN |
 					CAMEL_MESSAGE_DELETED);
 
-			camel_folder_thaw (folder);
-
-			g_object_unref (folder);
+				g_object_unref (folder);
+				g_free (real_uid);
+			}
 		}
 
 		priv->clipboard.uids = g_ptr_array_ref (uids);
@@ -1839,10 +1989,10 @@ ml_tree_value_at_ex (ETreeModel *etm,
 		return (gpointer) get_normalised_string (message_list, msg_info, col);
 	case COL_SUBJECT:
 		str = camel_message_info_get_subject (msg_info);
-		return (gpointer)(str ? str : "");
+		return (gpointer) ml_decorate_subject (message_list, msg_info, str, FALSE);
 	case COL_SUBJECT_TRIMMED:
 		str = get_trimmed_subject (msg_info, message_list);
-		return (gpointer)(str ? str : "");
+		return (gpointer) ml_decorate_subject (message_list, msg_info, str, TRUE);
 	case COL_SUBJECT_NORM:
 		return (gpointer) get_normalised_string (message_list, msg_info, col);
 	case COL_SENT: {
@@ -2153,9 +2303,41 @@ ml_tree_value_at_ex (ETreeModel *etm,
 	case COL_SUBJECT_WITH_BODY_PREVIEW: {
 		const gchar *subject = camel_message_info_get_subject (msg_info);
 		const gchar *preview = camel_message_info_get_preview (msg_info);
+		const gchar *folder_name;
 
 		if (!subject)
 			subject = "";
+
+		folder_name = ml_foreign_folder_name (message_list, msg_info);
+		if (folder_name != NULL) {
+			gchar *decorated = g_strdup_printf ("%s · %s", subject, folder_name);
+
+			if (preview && *preview) {
+				#define PREVIEW_PART_MARKUP "<span size='x-small'>%s</span>"
+				gchar *markup;
+
+				if (gtk_widget_get_direction (GTK_WIDGET (message_list)) == GTK_TEXT_DIR_RTL)
+					markup = g_markup_printf_escaped (PREVIEW_PART_MARKUP "   %s", preview, decorated);
+				else
+					markup = g_markup_printf_escaped ("%s   " PREVIEW_PART_MARKUP, decorated, preview);
+
+				#undef PREVIEW_PART_MARKUP
+				g_free (decorated);
+				return markup;
+			}
+
+			if (!*decorated) {
+				g_free (decorated);
+				return NULL;
+			}
+
+			subject = decorated;
+			if (preview == NULL || !*preview) {
+				gchar *markup = g_markup_escape_text (subject, -1);
+				g_free (decorated);
+				return markup;
+			}
+		}
 
 		if (preview && *preview) {
 			#define PREVIEW_PART_MARKUP "<span size='x-small'>%s</span>"
@@ -3266,13 +3448,66 @@ message_list_header_click_can_sort_cb (ETree *tree,
 }
 
 static void
+message_list_cache_folder_changed_cb (MailFolderCache *cache,
+                                      CamelStore *store,
+                                      const gchar *folder_name,
+                                      gint new_messages,
+                                      const gchar *msg_uid,
+                                      const gchar *msg_sender,
+                                      const gchar *msg_subject,
+                                      MessageList *message_list)
+{
+	CamelFolder *view;
+
+	if (message_list->priv->destroyed)
+		return;
+
+	e_mail_conversation_index_invalidate_folder (store, folder_name);
+
+	if (!message_list->priv->thread_include_other_folders ||
+	    !message_list->priv->group_by_threads)
+		return;
+
+	view = message_list_ref_folder (message_list);
+	if (!e_mail_conversation_index_change_affects_folder (
+		message_list->priv->session, view, store, folder_name, new_messages)) {
+		g_clear_object (&view);
+		return;
+	}
+	g_clear_object (&view);
+
+	if (message_list->frozen) {
+		message_list->priv->thaw_needs_regen = TRUE;
+		return;
+	}
+
+	/* A running rebuild already reads the index. Cancelling it here
+	 * starts a new status icon and, on a busy account, never lets the
+	 * first one finish. Remember that one more pass is needed. */
+	if (message_list->priv->regen_task != NULL) {
+		message_list->priv->other_folders_regen_pending = TRUE;
+		return;
+	}
+
+	mail_regen_list (message_list, NULL, NULL);
+}
+
+static void
 message_list_set_session (MessageList *message_list,
                           EMailSession *session)
 {
+	MailFolderCache *cache;
+
 	g_return_if_fail (E_IS_MAIL_SESSION (session));
 	g_return_if_fail (message_list->priv->session == NULL);
 
 	message_list->priv->session = g_object_ref (session);
+
+	cache = e_mail_session_get_folder_cache (session);
+	message_list->priv->folder_cache_changed_id = g_signal_connect (
+		cache, "folder-changed",
+		G_CALLBACK (message_list_cache_folder_changed_cb),
+		message_list);
 }
 
 static void
@@ -3338,6 +3573,12 @@ message_list_set_property (GObject *object,
 
 		case PROP_THREAD_FLAT_OUTLOOK:
 			message_list_set_thread_flat_outlook (
+				MESSAGE_LIST (object),
+				g_value_get_boolean (value));
+			return;
+
+		case PROP_THREAD_INCLUDE_OTHER_FOLDERS:
+			message_list_set_thread_include_other_folders (
 				MESSAGE_LIST (object),
 				g_value_get_boolean (value));
 			return;
@@ -3436,6 +3677,13 @@ message_list_get_property (GObject *object,
 				message_list_get_thread_flat_outlook (
 				MESSAGE_LIST (object)));
 			return;
+
+		case PROP_THREAD_INCLUDE_OTHER_FOLDERS:
+			g_value_set_boolean (
+				value,
+				message_list_get_thread_include_other_folders (
+				MESSAGE_LIST (object)));
+			return;
 	}
 
 	G_OBJECT_WARN_INVALID_PROPERTY_ID (object, property_id, pspec);
@@ -3456,6 +3704,13 @@ message_list_dispose (GObject *object)
 		priv->folder_changed_handler_id = 0;
 	}
 
+	if (priv->folder_cache_changed_id > 0 && priv->session != NULL) {
+		g_signal_handler_disconnect (
+			e_mail_session_get_folder_cache (priv->session),
+			priv->folder_cache_changed_id);
+		priv->folder_cache_changed_id = 0;
+	}
+
 	g_clear_pointer (&priv->copy_target_list, gtk_target_list_unref);
 	g_clear_pointer (&priv->paste_target_list, gtk_target_list_unref);
 
@@ -3470,6 +3725,25 @@ message_list_dispose (GObject *object)
 	g_clear_object (&message_list->priv->regen_task);
 
 	g_mutex_unlock (&message_list->priv->regen_lock);
+
+	if (message_list->priv->foreign_subjects != NULL)
+		g_hash_table_remove_all (message_list->priv->foreign_subjects);
+	if (message_list->priv->foreign_subjects_trimmed != NULL)
+		g_hash_table_remove_all (message_list->priv->foreign_subjects_trimmed);
+
+	if (message_list->priv->foreign_nodemap) {
+		g_hash_table_foreach (
+			message_list->priv->foreign_nodemap,
+			(GHFunc) clear_info, message_list);
+		g_hash_table_destroy (message_list->priv->node_keys);
+		g_hash_table_destroy (message_list->priv->foreign_nodemap);
+		message_list->priv->node_keys = NULL;
+		message_list->priv->foreign_nodemap = NULL;
+	}
+
+	g_clear_pointer (&message_list->priv->foreign_folders, g_ptr_array_unref);
+	g_clear_pointer (&message_list->priv->foreign_subjects, g_hash_table_unref);
+	g_clear_pointer (&message_list->priv->foreign_subjects_trimmed, g_hash_table_unref);
 
 	if (message_list->uid_nodemap) {
 		g_hash_table_foreach (
@@ -3709,7 +3983,7 @@ message_list_get_save_id (ETreeModel *tree_model,
 	if (info == NULL)
 		return NULL;
 
-	return g_strdup (camel_message_info_get_uid (info));
+	return g_strdup (get_message_uid (MESSAGE_LIST (tree_model), path));
 }
 
 static ETreePath
@@ -3723,7 +3997,7 @@ message_list_get_node_by_id (ETreeModel *tree_model,
 	if (!strcmp (save_id, "root"))
 		return e_tree_model_get_root (tree_model);
 
-	return g_hash_table_lookup (message_list->uid_nodemap, save_id);
+	return ml_uid_node (message_list, save_id);
 }
 
 static gboolean
@@ -4285,6 +4559,19 @@ message_list_class_init (MessageListClass *class)
 			G_PARAM_CONSTRUCT |
 			G_PARAM_STATIC_STRINGS);
 
+	/**
+	 * MessageList:thread-include-other-folders
+	 *
+	 * Show messages from other folders in a visible thread
+	 **/
+	properties[PROP_THREAD_INCLUDE_OTHER_FOLDERS] =
+		g_param_spec_boolean (
+			"thread-include-other-folders", NULL, NULL,
+			FALSE,
+			G_PARAM_READWRITE |
+			G_PARAM_CONSTRUCT |
+			G_PARAM_STATIC_STRINGS);
+
 	g_object_class_install_properties (object_class, N_PROPS, properties);
 
 	gtk_widget_class_install_style_property (
@@ -4393,6 +4680,15 @@ message_list_init (MessageList *message_list)
 		(GDestroyNotify) e_poolv_destroy);
 
 	message_list->uid_nodemap = g_hash_table_new (g_str_hash, g_str_equal);
+	message_list->priv->foreign_nodemap = g_hash_table_new_full (
+		g_str_hash, g_str_equal,
+		(GDestroyNotify) camel_pstring_free, NULL);
+	message_list->priv->node_keys = g_hash_table_new (g_direct_hash, g_direct_equal);
+	message_list->priv->foreign_folders = g_ptr_array_new_with_free_func (g_object_unref);
+	message_list->priv->foreign_subjects = g_hash_table_new_full (
+		g_direct_hash, g_direct_equal, NULL, g_free);
+	message_list->priv->foreign_subjects_trimmed = g_hash_table_new_full (
+		g_direct_hash, g_direct_equal, NULL, g_free);
 
 	message_list->cursor_uid = NULL;
 	message_list->last_sel_single = FALSE;
@@ -4620,6 +4916,21 @@ clear_tree (MessageList *message_list,
 			(GHFunc) clear_info, message_list);
 	g_hash_table_destroy (message_list->uid_nodemap);
 	message_list->uid_nodemap = g_hash_table_new (g_str_hash, g_str_equal);
+
+	if (message_list->priv->foreign_subjects != NULL)
+		g_hash_table_remove_all (message_list->priv->foreign_subjects);
+	if (message_list->priv->foreign_subjects_trimmed != NULL)
+		g_hash_table_remove_all (message_list->priv->foreign_subjects_trimmed);
+	if (message_list->priv->foreign_nodemap != NULL) {
+		g_hash_table_foreach (
+			message_list->priv->foreign_nodemap,
+			(GHFunc) clear_info, message_list);
+		g_hash_table_remove_all (message_list->priv->node_keys);
+		g_hash_table_remove_all (message_list->priv->foreign_nodemap);
+	}
+	if (message_list->priv->foreign_folders != NULL)
+		g_ptr_array_set_size (message_list->priv->foreign_folders, 0);
+
 	g_clear_object (&folder);
 
 	message_list->priv->newest_read_date = 0;
@@ -4792,9 +5103,6 @@ is_node_selectable (MessageList *message_list,
 
 	g_return_val_if_fail (info != NULL, FALSE);
 
-	if (removed_uids && g_hash_table_contains (removed_uids, camel_message_info_get_uid (info)))
-		return FALSE;
-
 	folder = message_list_ref_folder (message_list);
 	g_return_val_if_fail (folder != NULL, FALSE);
 
@@ -4807,6 +5115,18 @@ is_node_selectable (MessageList *message_list,
 
 	hide_junk = message_list_get_hide_junk (message_list, folder);
 	hide_deleted = message_list_get_hide_deleted (message_list, folder);
+
+	if (removed_uids != NULL) {
+		CamelFolder *info_folder = ml_info_folder (info);
+
+		/* Removals belong to the folder being viewed. A foreign
+		 * message can share that folder's UID without being removed. */
+		if ((info_folder == NULL || info_folder == folder) &&
+		    g_hash_table_contains (removed_uids, camel_message_info_get_uid (info))) {
+			g_object_unref (folder);
+			return FALSE;
+		}
+	}
 
 	g_object_unref (folder);
 
@@ -4855,8 +5175,8 @@ find_next_selectable (MessageList *message_list,
 	gint vrow_inc;
 	gint row_count;
 
-	node = g_hash_table_lookup (
-		message_list->uid_nodemap,
+	node = ml_uid_node (
+		message_list,
 		message_list->cursor_uid);
 	if (node == NULL)
 		return NULL;
@@ -4885,7 +5205,7 @@ find_next_selectable (MessageList *message_list,
 		node = e_tree_table_adapter_node_at_row (adapter, vrow);
 		info = get_message_info (message_list, node);
 		if (info && is_node_selectable (message_list, info, removed_uids))
-			return g_strdup (camel_message_info_get_uid (info));
+			return g_strdup (get_message_uid (message_list, node));
 		vrow += vrow_inc;
 	}
 
@@ -4899,7 +5219,7 @@ find_next_selectable (MessageList *message_list,
 		node = e_tree_table_adapter_node_at_row (adapter, vrow);
 		info = get_message_info (message_list, node);
 		if (info && is_node_selectable (message_list, info, removed_uids))
-			return g_strdup (camel_message_info_get_uid (info));
+			return g_strdup (get_message_uid (message_list, node));
 		vrow += vrow_inc;
 	}
 
@@ -4928,10 +5248,34 @@ ml_uid_nodemap_insert (MessageList *message_list,
 	date = camel_message_info_get_date_received (info);
 
 	g_object_ref (info);
+
+	if (ml_info_folder (info) != message_list->priv->folder) {
+		CamelFolder *info_folder = ml_info_folder (info);
+		CamelStore *store = camel_folder_get_parent_store (info_folder);
+		gchar *built;
+		const gchar *key;
+
+		built = g_strdup_printf (
+			"%s%s\001%s\001%s",
+			ML_FOREIGN_UID_PREFIX,
+			camel_service_get_uid (CAMEL_SERVICE (store)),
+			camel_folder_get_full_name (info_folder),
+			uid);
+		key = camel_pstring_strdup (built);
+		g_free (built);
+
+		g_hash_table_insert (message_list->priv->foreign_nodemap, (gpointer) key, node);
+		g_hash_table_insert (message_list->priv->node_keys, node, (gpointer) key);
+		ml_remember_folder (message_list, info_folder);
+		return node;
+	}
+
 	g_hash_table_replace (message_list->uid_nodemap, (gpointer) uid, node);
 
 	/* Track the latest seen and unseen messages shown, used in
-	 * fallback heuristics for automatic message selection. */
+	 * fallback heuristics for automatic message selection.
+	 * Messages from other folders are not candidates: an unread
+	 * message elsewhere must not steal the cursor from this folder. */
 	if (flags & CAMEL_MESSAGE_SEEN) {
 		if (date > message_list->priv->newest_read_date) {
 			message_list->priv->newest_read_date = date;
@@ -5056,14 +5400,32 @@ flat_outlook_swap_message (MessageList *message_list,
 	if (!info_a || !info_b)
 		return;
 
-	uid_a = camel_message_info_get_uid (info_a);
-	uid_b = camel_message_info_get_uid (info_b);
+	uid_a = get_message_uid (message_list, node_a);
+	uid_b = get_message_uid (message_list, node_b);
 
 	node_a->data = info_b;
 	node_b->data = info_a;
 
-	g_hash_table_insert (message_list->uid_nodemap, (gpointer) uid_a, node_b);
-	g_hash_table_insert (message_list->uid_nodemap, (gpointer) uid_b, node_a);
+	if (g_hash_table_contains (message_list->priv->node_keys, node_a))
+		g_hash_table_steal (message_list->priv->node_keys, node_a);
+	if (g_hash_table_contains (message_list->priv->node_keys, node_b))
+		g_hash_table_steal (message_list->priv->node_keys, node_b);
+
+	if (uid_a != NULL && g_str_has_prefix (uid_a, ML_FOREIGN_UID_PREFIX)) {
+		g_hash_table_steal (message_list->priv->foreign_nodemap, uid_a);
+		g_hash_table_insert (message_list->priv->foreign_nodemap, (gpointer) uid_a, node_b);
+		g_hash_table_insert (message_list->priv->node_keys, node_b, (gpointer) uid_a);
+	} else if (uid_a != NULL) {
+		g_hash_table_insert (message_list->uid_nodemap, (gpointer) uid_a, node_b);
+	}
+
+	if (uid_b != NULL && g_str_has_prefix (uid_b, ML_FOREIGN_UID_PREFIX)) {
+		g_hash_table_steal (message_list->priv->foreign_nodemap, uid_b);
+		g_hash_table_insert (message_list->priv->foreign_nodemap, (gpointer) uid_b, node_a);
+		g_hash_table_insert (message_list->priv->node_keys, node_a, (gpointer) uid_b);
+	} else if (uid_b != NULL) {
+		g_hash_table_insert (message_list->uid_nodemap, (gpointer) uid_b, node_a);
+	}
 }
 
 static void
@@ -5282,8 +5644,8 @@ build_flat (MessageList *message_list,
 	if (saveuid) {
 		GNode *node;
 
-		node = g_hash_table_lookup (
-			message_list->uid_nodemap, saveuid);
+		node = ml_uid_node (
+			message_list, saveuid);
 		if (node == NULL) {
 			g_free (message_list->cursor_uid);
 			message_list->cursor_uid = NULL;
@@ -5343,8 +5705,8 @@ mail_folder_hide_by_flag (CamelFolder *folder,
 		GNode *node;
 		guint32 flags;
 
-		node = g_hash_table_lookup (
-			message_list->uid_nodemap,
+		node = ml_uid_node (
+			message_list,
 			changes->uid_changed->pdata[i]);
 		info = camel_folder_get_message_info (
 			folder, changes->uid_changed->pdata[i]);
@@ -5921,6 +6283,35 @@ message_list_set_thread_flat_outlook (MessageList *message_list,
 }
 
 gboolean
+message_list_get_thread_include_other_folders (MessageList *message_list)
+{
+	g_return_val_if_fail (IS_MESSAGE_LIST (message_list), FALSE);
+
+	return message_list->priv->thread_include_other_folders;
+}
+
+void
+message_list_set_thread_include_other_folders (MessageList *message_list,
+					       gboolean include)
+{
+	g_return_if_fail (IS_MESSAGE_LIST (message_list));
+
+	if ((include ? 1 : 0) == (message_list->priv->thread_include_other_folders ? 1 : 0))
+		return;
+
+	message_list->priv->thread_include_other_folders = include;
+
+	g_object_notify_by_pspec (G_OBJECT (message_list), properties[PROP_THREAD_INCLUDE_OTHER_FOLDERS]);
+
+	if (message_list->priv->group_by_threads) {
+		if (!message_list->frozen)
+			mail_regen_list (message_list, NULL, NULL);
+		else
+			message_list->priv->thaw_needs_regen = TRUE;
+	}
+}
+
+gboolean
 message_list_get_regen_selects_unread (MessageList *message_list)
 {
 	g_return_val_if_fail (IS_MESSAGE_LIST (message_list), FALSE);
@@ -6020,7 +6411,7 @@ on_selection_changed_cmd (ETree *tree,
 		else
 			newuid = NULL;
 	} else if ((cursor = e_tree_get_cursor (tree)))
-		newuid = (gchar *) camel_message_info_get_uid (cursor->data);
+		newuid = (gchar *) get_message_uid (message_list, cursor);
 	else
 		newuid = NULL;
 
@@ -6070,7 +6461,11 @@ on_click (ETree *tree,
 	if (!(info = get_message_info (list, node)))
 		return FALSE;
 
-	folder = message_list_ref_folder (list);
+	folder = ml_info_folder (info);
+	if (folder != NULL)
+		g_object_ref (folder);
+	else
+		folder = message_list_ref_folder (list);
 	g_return_val_if_fail (folder != NULL, FALSE);
 
 	if (col == COL_FOLLOWUP_FLAG_STATUS) {
@@ -6132,7 +6527,7 @@ on_click (ETree *tree,
 	}
 
 	if (flag == CAMEL_MESSAGE_SEEN && list->seen_id &&
-	    g_strcmp0 (list->cursor_uid, camel_message_info_get_uid (info)) == 0) {
+	    g_strcmp0 (list->cursor_uid, get_message_uid (list, node)) == 0) {
 		g_source_remove (list->seen_id);
 		list->seen_id = 0;
 	}
@@ -6185,6 +6580,21 @@ ml_getselected_cb (GNode *node,
 	}
 }
 
+static gboolean
+ml_uids_have_foreign (GPtrArray *uids)
+{
+	guint ii;
+
+	for (ii = 0; uids != NULL && ii < uids->len; ii++) {
+		const gchar *uid = uids->pdata[ii];
+
+		if (uid != NULL && g_str_has_prefix (uid, ML_FOREIGN_UID_PREFIX))
+			return TRUE;
+	}
+
+	return FALSE;
+}
+
 static GPtrArray *
 message_list_get_selected_full (MessageList *message_list,
 				gboolean with_collapsed_threads)
@@ -6212,7 +6622,8 @@ message_list_get_selected_full (MessageList *message_list,
 
 	folder = message_list_ref_folder (message_list);
 
-	if (folder != NULL && data.uids->len > 0)
+	if (folder != NULL && data.uids->len > 0 &&
+	    !ml_uids_have_foreign (data.uids))
 		camel_folder_sort_uids (folder, data.uids);
 
 	g_clear_object (&folder);
@@ -6247,8 +6658,8 @@ message_list_set_selected (MessageList *message_list,
 	etsm = (ETreeSelectionModel *)
 		e_tree_get_selection_model (E_TREE (message_list));
 	for (i = 0; i < uids->len; i++) {
-		node = g_hash_table_lookup (
-			message_list->uid_nodemap, uids->pdata[i]);
+		node = ml_uid_node (
+			message_list, uids->pdata[i]);
 		if (node != NULL)
 			g_ptr_array_add (paths, node);
 	}
@@ -6297,7 +6708,7 @@ message_list_sort_uids (MessageList *message_list,
 		data = g_new0 (struct ml_sort_uids_data, 1);
 		data->uid = g_ptr_array_index (uids, ii);
 
-		node = g_hash_table_lookup (message_list->uid_nodemap, data->uid);
+		node = ml_uid_node (message_list, data->uid);
 		if (node != NULL)
 			data->row = e_tree_table_adapter_row_of_node (adapter, node);
 		else
@@ -6509,6 +6920,259 @@ message_list_regen_tweak_search_results (MessageList *message_list,
 	g_clear_object (&info);
 }
 
+static GPrivate ml_thread_foreign_subjects;
+
+static guint
+ml_id_hash (gconstpointer key)
+{
+	guint64 value = * ((const guint64 *) key);
+
+	return (guint) (value ^ (value >> 32));
+}
+
+static gboolean
+ml_id_equal (gconstpointer a,
+             gconstpointer b)
+{
+	return * ((const guint64 *) a) == * ((const guint64 *) b);
+}
+
+static void
+ml_id_set_add (GHashTable *set,
+               guint64 value)
+{
+	guint64 *copy;
+
+	if (value == 0 || g_hash_table_contains (set, &value))
+		return;
+
+	copy = g_new (guint64, 1);
+	*copy = value;
+	g_hash_table_add (set, copy);
+}
+
+static const gchar *
+ml_thread_get_uid (gconstpointer item)
+{
+	return camel_message_info_get_uid (item);
+}
+
+static const gchar *
+ml_thread_get_subject (gconstpointer item)
+{
+	GHashTable *foreign;
+	const gchar *unique;
+
+	foreign = g_private_get (&ml_thread_foreign_subjects);
+	if (foreign != NULL) {
+		unique = g_hash_table_lookup (foreign, item);
+		if (unique != NULL)
+			return unique;
+	}
+
+	return camel_message_info_get_subject (item);
+}
+
+static guint64
+ml_thread_get_message_id (gconstpointer item)
+{
+	return camel_message_info_get_message_id (item);
+}
+
+static const GArray *
+ml_thread_get_references (gconstpointer item)
+{
+	return camel_message_info_get_references (item);
+}
+
+static gint64
+ml_thread_get_date_sent (gconstpointer item)
+{
+	return camel_message_info_get_date_sent (item);
+}
+
+static gint64
+ml_thread_get_date_received (gconstpointer item)
+{
+	return camel_message_info_get_date_received (item);
+}
+
+static void
+ml_thread_lock (gconstpointer item)
+{
+	camel_message_info_property_lock (item);
+}
+
+static void
+ml_thread_unlock (gconstpointer item)
+{
+	camel_message_info_property_unlock (item);
+}
+
+static void
+ml_collect_ids (GHashTable *seeds,
+                GHashTable *known,
+                CamelMessageInfo *info)
+{
+	const GArray *references;
+	guint ii;
+
+	ml_id_set_add (seeds, camel_message_info_get_message_id (info));
+	ml_id_set_add (known, camel_message_info_get_message_id (info));
+
+	references = camel_message_info_get_references (info);
+	if (references == NULL)
+		return;
+
+	for (ii = 0; ii < references->len; ii++)
+		ml_id_set_add (seeds, g_array_index (references, guint64, ii));
+}
+
+/* Thread the visible messages together with related messages from
+ * other folders. Subject fallback stays inside the viewed folder:
+ * foreign messages are given a subject that cannot collide. */
+static CamelFolderThread *
+message_list_thread_with_other_folders (MessageList *message_list,
+                                        RegenData *regen_data,
+                                        CamelFolder *folder,
+                                        GPtrArray *uids,
+                                        gboolean hide_deleted,
+                                        gboolean hide_junk,
+                                        GCancellable *cancellable)
+{
+	CamelFolderThreadFlags thread_flags;
+	CamelFolderThread *thread;
+	EMailSession *session;
+	GPtrArray *items;
+	GPtrArray *hits = NULL;
+	GHashTable *seeds;
+	GHashTable *known;
+	GHashTable *foreign_subjects;
+	gint64 started = g_get_monotonic_time ();
+	guint ii;
+
+	thread_flags = regen_data->thread_subject ?
+		CAMEL_FOLDER_THREAD_FLAG_SUBJECT :
+		CAMEL_FOLDER_THREAD_FLAG_NONE;
+
+	items = g_ptr_array_new_with_free_func (g_object_unref);
+	camel_folder_summary_prepare_fetch_all (
+		camel_folder_get_folder_summary (folder), NULL);
+
+	seeds = g_hash_table_new_full (ml_id_hash, ml_id_equal, g_free, NULL);
+	known = g_hash_table_new_full (ml_id_hash, ml_id_equal, g_free, NULL);
+
+	for (ii = 0; ii < uids->len; ii++) {
+		CamelMessageInfo *info;
+
+		info = camel_folder_get_message_info (folder, uids->pdata[ii]);
+		if (info == NULL)
+			continue;
+
+		ml_collect_ids (seeds, known, info);
+		g_ptr_array_add (items, info);
+	}
+
+	session = message_list_get_session (message_list);
+	if (session != NULL && g_hash_table_size (seeds) > 0) {
+		hits = e_mail_conversation_index_find_related (
+			session, folder, seeds, known,
+			hide_deleted, hide_junk, cancellable, NULL);
+	}
+
+	foreign_subjects = g_hash_table_new_full (
+		g_direct_hash, g_direct_equal, NULL, g_free);
+
+	if (hits != NULL) {
+		GHashTable *opened;
+		GHashTable *hit_counts;
+
+		opened = g_hash_table_new_full (g_str_hash, g_str_equal, g_free, NULL);
+		hit_counts = g_hash_table_new_full (g_str_hash, g_str_equal, g_free, NULL);
+		if (regen_data->extra_folders == NULL)
+			regen_data->extra_folders = g_ptr_array_new_with_free_func (g_object_unref);
+
+		for (ii = 0; ii < hits->len; ii++) {
+			EMailConversationHit *hit = hits->pdata[ii];
+			gchar *key;
+
+			key = g_strdup_printf ("%p\n%s", hit->store, hit->folder_name);
+			g_hash_table_insert (hit_counts, key, GUINT_TO_POINTER (
+				GPOINTER_TO_UINT (g_hash_table_lookup (hit_counts, key)) + 1));
+		}
+
+		for (ii = 0; ii < hits->len; ii++) {
+			EMailConversationHit *hit = hits->pdata[ii];
+			CamelFolder *other;
+			CamelMessageInfo *info;
+			gchar *key;
+
+			key = g_strdup_printf ("%p\n%s", hit->store, hit->folder_name);
+			other = g_hash_table_lookup (opened, key);
+			if (other == NULL) {
+				other = camel_store_get_folder_sync (
+					hit->store, hit->folder_name,
+					0, cancellable, NULL);
+				if (other == NULL) {
+					g_free (key);
+					continue;
+				}
+
+				/* Reading many messages one by one costs a
+				 * database query each; one bulk read is faster. */
+				if (GPOINTER_TO_UINT (g_hash_table_lookup (hit_counts, key)) >= ML_FOREIGN_BULK_FETCH)
+					camel_folder_summary_prepare_fetch_all (
+						camel_folder_get_folder_summary (other), NULL);
+
+				g_hash_table_insert (opened, key, other);
+				g_ptr_array_add (regen_data->extra_folders, other);
+			} else {
+				g_free (key);
+			}
+
+			/* The index already left out copies of messages
+			 * shown here and of earlier hits. */
+			info = camel_folder_get_message_info (other, hit->uid);
+			if (info == NULL)
+				continue;
+
+			g_hash_table_insert (
+				foreign_subjects, info,
+				g_strdup_printf ("\001evo-xfld-subject\001%p", (gpointer) info));
+			g_ptr_array_add (items, info);
+		}
+
+		dd (g_print ("%s: %s: %u seeds, %u hits, %u folders, %u messages added in %" G_GINT64_FORMAT " ms\n", G_STRFUNC,
+			camel_folder_get_full_name (folder), g_hash_table_size (seeds), hits->len,
+			g_hash_table_size (opened), g_hash_table_size (foreign_subjects),
+			(g_get_monotonic_time () - started) / 1000));
+
+		g_hash_table_destroy (opened);
+		g_hash_table_destroy (hit_counts);
+		g_ptr_array_unref (hits);
+	}
+
+	g_hash_table_destroy (seeds);
+	g_hash_table_destroy (known);
+
+	g_private_set (&ml_thread_foreign_subjects, foreign_subjects);
+	thread = camel_folder_thread_new_items (
+		items, thread_flags,
+		ml_thread_get_uid,
+		ml_thread_get_subject,
+		ml_thread_get_message_id,
+		ml_thread_get_references,
+		ml_thread_get_date_sent,
+		ml_thread_get_date_received,
+		ml_thread_lock,
+		ml_thread_unlock);
+	g_private_set (&ml_thread_foreign_subjects, NULL);
+	g_hash_table_destroy (foreign_subjects);
+	g_ptr_array_unref (items);
+
+	return thread;
+}
+
 static void
 message_list_regen_thread (GTask *task,
                            gpointer source_object,
@@ -6662,7 +7326,17 @@ message_list_regen_thread (GTask *task,
 		/* Always build a new thread_tree, to avoid race condition
 		   when accessing it here and in the build_tree() call
 		   from multiple threads. */
-		thread_tree = camel_folder_thread_new (folder, uids, regen_data->thread_subject ? CAMEL_FOLDER_THREAD_FLAG_SUBJECT : CAMEL_FOLDER_THREAD_FLAG_NONE);
+		if (regen_data->thread_include_other_folders &&
+		    !CAMEL_IS_VEE_FOLDER (folder))
+			thread_tree = message_list_thread_with_other_folders (
+				message_list, regen_data, folder, uids,
+				hide_deleted, hide_junk, cancellable);
+		else
+			thread_tree = camel_folder_thread_new (
+				folder, uids,
+				regen_data->thread_subject ?
+				CAMEL_FOLDER_THREAD_FLAG_SUBJECT :
+				CAMEL_FOLDER_THREAD_FLAG_NONE);
 
 		/* We will build the ETreeModel content from this
 		 * CamelFolderThread during regen post-processing.
@@ -6790,7 +7464,7 @@ message_list_correct_row_for_remove_in_selection (MessageList *message_list,
 	for (ii = 0; ii < selected->len; ii++) {
 		gint sel_row, sel_dist;
 
-		node = g_hash_table_lookup (message_list->uid_nodemap, g_ptr_array_index (selected, ii));
+		node = ml_uid_node (message_list, g_ptr_array_index (selected, ii));
 		if (!node || g_hash_table_contains (removed_uids, get_message_uid (message_list, node)))
 			continue;
 
@@ -7033,8 +7707,8 @@ message_list_regen_done_cb (GObject *source_object,
 
 		e_table_item_thaw (table_item);
 
-		if ((!saveuid || !g_hash_table_lookup (message_list->uid_nodemap, saveuid)) &&
-		    message_list->cursor_uid && g_hash_table_lookup (message_list->uid_nodemap, message_list->cursor_uid)) {
+		if ((!saveuid || !ml_uid_node (message_list, saveuid)) &&
+		    message_list->cursor_uid && ml_uid_node (message_list, message_list->cursor_uid)) {
 			/* this makes sure a visible node is selected, like when
 			 * collapsing all nodes and a children had been selected
 			 */
@@ -7047,8 +7721,8 @@ message_list_regen_done_cb (GObject *source_object,
 		} else if (saveuid) {
 			GNode *node;
 
-			node = g_hash_table_lookup (
-				message_list->uid_nodemap, saveuid);
+			node = ml_uid_node (
+				message_list, saveuid);
 			if (node == NULL) {
 				g_free (message_list->cursor_uid);
 				message_list->cursor_uid = NULL;
@@ -7076,7 +7750,7 @@ message_list_regen_done_cb (GObject *source_object,
 				e_table_item_thaw (table_item);
 			}
 			g_free (saveuid);
-		} else if (message_list->cursor_uid && !g_hash_table_lookup (message_list->uid_nodemap, message_list->cursor_uid)) {
+		} else if (message_list->cursor_uid && !ml_uid_node (message_list, message_list->cursor_uid)) {
 			g_free (message_list->cursor_uid);
 			message_list->cursor_uid = NULL;
 			g_signal_emit (
@@ -7096,7 +7770,7 @@ message_list_regen_done_cb (GObject *source_object,
 	if (start_selection_uid) {
 		GNode *node;
 
-		node = g_hash_table_lookup (message_list->uid_nodemap, start_selection_uid);
+		node = ml_uid_node (message_list, start_selection_uid);
 		if (node) {
 			gint row;
 
@@ -7140,7 +7814,7 @@ message_list_regen_done_cb (GObject *source_object,
 				for (ii = 0; ii < selected->len; ii++) {
 					GNode *selected_node;
 
-					selected_node = g_hash_table_lookup (message_list->uid_nodemap, g_ptr_array_index (selected, ii));
+					selected_node = ml_uid_node (message_list, g_ptr_array_index (selected, ii));
 					if (selected_node) {
 						gint selected_row;
 
@@ -7160,7 +7834,7 @@ message_list_regen_done_cb (GObject *source_object,
 					gint start_sel_row, new_last_row = regen_data->last_row;
 
 					start_sel_row = e_tree_selection_model_get_selection_start_row (E_TREE_SELECTION_MODEL (e_tree_get_selection_model (tree)));
-					node = g_hash_table_lookup (message_list->uid_nodemap, last_row_uid);
+					node = ml_uid_node (message_list, last_row_uid);
 					if (node)
 						new_last_row = e_tree_table_adapter_row_of_node (adapter, node);
 
@@ -7190,7 +7864,7 @@ message_list_regen_done_cb (GObject *source_object,
 		}
 
 		if (!node)
-			node = g_hash_table_lookup (message_list->uid_nodemap, last_row_uid);
+			node = ml_uid_node (message_list, last_row_uid);
 
 		if (!node) {
 			if (regen_data->last_row >= row_count)
@@ -7241,6 +7915,16 @@ message_list_regen_done_cb (GObject *source_object,
 	}
 
 	e_util_call_malloc_trim_limited ();
+
+	if (message_list->priv->other_folders_regen_pending &&
+	    !message_list->priv->destroyed &&
+	    message_list->priv->thread_include_other_folders &&
+	    message_list_get_group_by_threads (message_list)) {
+		message_list->priv->other_folders_regen_pending = FALSE;
+		mail_regen_list (message_list, NULL, NULL);
+	} else {
+		message_list->priv->other_folders_regen_pending = FALSE;
+	}
 }
 
 static gboolean
@@ -7265,6 +7949,7 @@ message_list_regen_idle_cb (gpointer user_data)
 	regen_data->thread_subject = message_list_get_thread_subject (message_list);
 	regen_data->thread_flat = message_list_get_thread_flat (message_list);
 	regen_data->thread_flat_outlook = message_list_get_thread_flat_outlook (message_list);
+	regen_data->thread_include_other_folders = message_list_get_thread_include_other_folders (message_list);
 	regen_data->thread_latest = message_list_get_thread_latest (message_list);
 	regen_data->select_unread = message_list_get_regen_selects_unread (message_list);
 
@@ -7473,6 +8158,72 @@ exit:
 }
 
 gboolean
+message_list_resolve_uid (MessageList *message_list,
+			  const gchar *uid,
+			  CamelFolder **out_folder,
+			  gchar **out_real_uid)
+{
+	GNode *node;
+	CamelMessageInfo *info;
+	CamelFolder *folder;
+
+	g_return_val_if_fail (IS_MESSAGE_LIST (message_list), FALSE);
+
+	if (out_folder != NULL)
+		*out_folder = NULL;
+	if (out_real_uid != NULL)
+		*out_real_uid = NULL;
+
+	if (uid == NULL || uid[0] == '\0')
+		return FALSE;
+
+	node = ml_uid_node (message_list, uid);
+	if (node != NULL && node->data != NULL) {
+		info = node->data;
+		folder = ml_info_folder (info);
+		if (folder != NULL) {
+			if (out_folder != NULL)
+				*out_folder = g_object_ref (folder);
+			if (out_real_uid != NULL)
+				*out_real_uid = g_strdup (camel_message_info_get_uid (info));
+			return TRUE;
+		}
+	}
+
+	if (g_str_has_prefix (uid, ML_FOREIGN_UID_PREFIX))
+		return FALSE;
+
+	folder = message_list_ref_folder (message_list);
+	if (folder == NULL)
+		return FALSE;
+
+	if (out_folder != NULL)
+		*out_folder = folder;
+	else
+		g_object_unref (folder);
+
+	if (out_real_uid != NULL)
+		*out_real_uid = g_strdup (uid);
+
+	return TRUE;
+}
+
+CamelMessageInfo *
+message_list_ref_message_info (MessageList *message_list,
+			       const gchar *uid)
+{
+	GNode *node;
+
+	g_return_val_if_fail (IS_MESSAGE_LIST (message_list), NULL);
+
+	node = ml_uid_node (message_list, uid);
+	if (node == NULL || node->data == NULL)
+		return NULL;
+
+	return g_object_ref (node->data);
+}
+
+gboolean
 message_list_contains_uid (MessageList *message_list,
 			   const gchar *uid)
 {
@@ -7481,7 +8232,7 @@ message_list_contains_uid (MessageList *message_list,
 	if (!uid || !*uid || !message_list->priv->folder)
 		return FALSE;
 
-	return g_hash_table_lookup (message_list->uid_nodemap, uid) != NULL;
+	return ml_uid_node (message_list, uid) != NULL;
 }
 
 void
