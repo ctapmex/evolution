@@ -141,6 +141,14 @@ void		e_mail_folder_save_messages	(CamelFolder *folder,
 						 GCancellable *cancellable,
 						 GAsyncReadyCallback callback,
 						 gpointer user_data);
+void		e_mail_folder_save_messages_from_folders
+						(GPtrArray *folders,
+						 GPtrArray *message_uids,
+						 GFile *destination,
+						 gint io_priority,
+						 GCancellable *cancellable,
+						 GAsyncReadyCallback callback,
+						 gpointer user_data);
 gboolean	e_mail_folder_save_messages_finish
 						(CamelFolder *folder,
 						 GAsyncResult *result,

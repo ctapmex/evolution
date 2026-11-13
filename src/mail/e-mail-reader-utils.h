@@ -110,6 +110,10 @@ gboolean	e_mail_reader_resolve_uid	(EMailReader *reader,
 						 const gchar *list_uid,
 						 CamelFolder **out_folder,
 						 gchar **out_real_uid);
+gboolean	e_mail_reader_resolve_uids	(EMailReader *reader,
+						 GPtrArray *list_uids,
+						 GPtrArray **out_folders,
+						 GPtrArray **out_real_uids);
 CamelMessageInfo *
 		e_mail_reader_ref_message_info	(EMailReader *reader,
 						 const gchar *list_uid);

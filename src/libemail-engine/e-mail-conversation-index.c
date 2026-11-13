@@ -10,8 +10,11 @@
 
 #include "e-mail-folder-utils.h"
 
-/* How many times to follow replies-of-replies before stopping. */
-#define CONVERSATION_INDEX_MAX_PASSES 8
+/* How many times to follow replies-of-replies before stopping. Every
+ * message is indexed under all its References, so the first pass finds
+ * nearly all of a conversation; later passes only repair broken
+ * References headers. */
+#define CONVERSATION_INDEX_MAX_PASSES 3
 
 typedef struct _ConvMsg {
 	gchar *folder_name;

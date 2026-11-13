@@ -698,15 +698,21 @@ action_reply_with_template_cb (EMailTemplatesStore *templates_store,
 	EActivity *activity;
 	AsyncContext *context;
 	GCancellable *cancellable;
-	CamelFolder *folder;
+	CamelFolder *folder = NULL;
 	GPtrArray *uids;
 	const gchar *message_uid;
+	gchar *real_uid = NULL;
 
 	g_return_if_fail (E_IS_MAIL_READER (reader));
 
 	uids = e_mail_reader_get_selected_uids (reader);
 	g_return_if_fail (uids != NULL && uids->len == 1);
-	message_uid = g_ptr_array_index (uids, 0);
+
+	if (!e_mail_reader_resolve_uid (reader, g_ptr_array_index (uids, 0), &folder, &real_uid)) {
+		g_ptr_array_unref (uids);
+		return;
+	}
+	message_uid = real_uid;
 
 	activity = e_mail_reader_new_activity (reader);
 	cancellable = e_activity_get_cancellable (activity);
@@ -717,8 +723,6 @@ action_reply_with_template_cb (EMailTemplatesStore *templates_store,
 	context->orig_source_message_uid = g_strdup (message_uid);
 	context->template_folder = g_object_ref (template_folder);
 	context->template_message_uid = g_strdup (template_message_uid);
-
-	folder = e_mail_reader_ref_folder (reader);
 
 	em_utils_get_real_folder_uri_and_message_uid (
 		folder, message_uid,
@@ -732,6 +736,7 @@ action_reply_with_template_cb (EMailTemplatesStore *templates_store,
 		template_got_message_cb, context);
 
 	g_clear_object (&folder);
+	g_free (real_uid);
 	g_ptr_array_unref (uids);
 }
 

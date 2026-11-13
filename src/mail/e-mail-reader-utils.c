@@ -1047,6 +1047,46 @@ e_mail_reader_resolve_uid (EMailReader *reader,
 	return out_folder == NULL || *out_folder != NULL;
 }
 
+/* Resolves list UIDs in order. Both returned arrays have the same
+ * length; rows that are gone are skipped. */
+gboolean
+e_mail_reader_resolve_uids (EMailReader *reader,
+                            GPtrArray *list_uids,
+                            GPtrArray **out_folders,
+                            GPtrArray **out_real_uids)
+{
+	GPtrArray *folders;
+	GPtrArray *real_uids;
+	guint ii;
+
+	g_return_val_if_fail (E_IS_MAIL_READER (reader), FALSE);
+	g_return_val_if_fail (list_uids != NULL, FALSE);
+	g_return_val_if_fail (out_folders != NULL, FALSE);
+	g_return_val_if_fail (out_real_uids != NULL, FALSE);
+
+	folders = g_ptr_array_new_with_free_func (g_object_unref);
+	real_uids = g_ptr_array_new_with_free_func (g_free);
+
+	for (ii = 0; ii < list_uids->len; ii++) {
+		CamelFolder *folder = NULL;
+		gchar *real_uid = NULL;
+
+		if (e_mail_reader_resolve_uid (reader, list_uids->pdata[ii], &folder, &real_uid) &&
+		    folder != NULL && real_uid != NULL) {
+			g_ptr_array_add (folders, folder);
+			g_ptr_array_add (real_uids, real_uid);
+		} else {
+			g_clear_object (&folder);
+			g_free (real_uid);
+		}
+	}
+
+	*out_folders = folders;
+	*out_real_uids = real_uids;
+
+	return real_uids->len > 0;
+}
+
 CamelMessageInfo *
 e_mail_reader_ref_message_info (EMailReader *reader,
                                 const gchar *list_uid)
@@ -3255,6 +3295,30 @@ e_mail_reader_save_messages (EMailReader *reader)
 			folder = g_object_ref (group->folder);
 			g_ptr_array_unref (uids);
 			uids = g_ptr_array_ref (group->uids);
+		} else if (groups->len > 1) {
+			GPtrArray *folders = NULL;
+			GPtrArray *real_uids = NULL;
+
+			g_ptr_array_unref (groups);
+
+			/* Keep the list order: one file gets every message. */
+			if (e_mail_reader_resolve_uids (reader, uids, &folders, &real_uids)) {
+				e_mail_folder_save_messages_from_folders (
+					folders, real_uids,
+					destination,
+					G_PRIORITY_DEFAULT,
+					cancellable,
+					mail_reader_save_messages_cb,
+					async_context);
+			} else {
+				async_context_free (async_context);
+			}
+
+			g_ptr_array_unref (folders);
+			g_ptr_array_unref (real_uids);
+			g_object_unref (activity);
+			g_object_unref (destination);
+			goto exit;
 		}
 
 		g_ptr_array_unref (groups);

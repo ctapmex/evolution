@@ -394,6 +394,24 @@ action_mail_message_new_cb (EUIAction *action,
 
 		if (selected_uids)
 			g_ptr_array_unref (selected_uids);
+
+		if (message_uid) {
+			CamelFolder *real_folder = NULL;
+			gchar *real_uid = NULL;
+
+			gboolean resolved;
+
+			resolved = message_list_resolve_uid (ml, message_uid, &real_folder, &real_uid);
+			camel_pstring_free (message_uid);
+			message_uid = NULL;
+
+			if (resolved) {
+				g_clear_object (&folder);
+				folder = real_folder;
+				message_uid = camel_pstring_strdup (real_uid);
+			}
+			g_free (real_uid);
+		}
 	}
 
  exit:

@@ -216,6 +216,7 @@ static void	mail_regen_list		(MessageList *message_list,
 /* List key for a message that lives in another folder. The bytes are
  * store-uid, folder full name and the real UID, split by 0x01. */
 #define ML_FOREIGN_UID_PREFIX "\001evo-xfld\001"
+#define ML_FOREIGN_BULK_FETCH 200
 
 G_DEFINE_TYPE_WITH_CODE (MessageList, message_list, E_TYPE_TREE,
 	G_ADD_PRIVATE (MessageList)
@@ -7047,6 +7048,7 @@ message_list_thread_with_other_folders (MessageList *message_list,
 	GHashTable *seeds;
 	GHashTable *known;
 	GHashTable *foreign_subjects;
+	gint64 started = g_get_monotonic_time ();
 	guint ii;
 
 	thread_flags = regen_data->thread_subject ?
@@ -7083,10 +7085,21 @@ message_list_thread_with_other_folders (MessageList *message_list,
 
 	if (hits != NULL) {
 		GHashTable *opened;
+		GHashTable *hit_counts;
 
 		opened = g_hash_table_new_full (g_str_hash, g_str_equal, g_free, NULL);
+		hit_counts = g_hash_table_new_full (g_str_hash, g_str_equal, g_free, NULL);
 		if (regen_data->extra_folders == NULL)
 			regen_data->extra_folders = g_ptr_array_new_with_free_func (g_object_unref);
+
+		for (ii = 0; ii < hits->len; ii++) {
+			EMailConversationHit *hit = hits->pdata[ii];
+			gchar *key;
+
+			key = g_strdup_printf ("%p\n%s", hit->store, hit->folder_name);
+			g_hash_table_insert (hit_counts, key, GUINT_TO_POINTER (
+				GPOINTER_TO_UINT (g_hash_table_lookup (hit_counts, key)) + 1));
+		}
 
 		for (ii = 0; ii < hits->len; ii++) {
 			EMailConversationHit *hit = hits->pdata[ii];
@@ -7104,6 +7117,12 @@ message_list_thread_with_other_folders (MessageList *message_list,
 					g_free (key);
 					continue;
 				}
+
+				/* Reading many messages one by one costs a
+				 * database query each; one bulk read is faster. */
+				if (GPOINTER_TO_UINT (g_hash_table_lookup (hit_counts, key)) >= ML_FOREIGN_BULK_FETCH)
+					camel_folder_summary_prepare_fetch_all (
+						camel_folder_get_folder_summary (other), NULL);
 
 				g_hash_table_insert (opened, key, other);
 				g_ptr_array_add (regen_data->extra_folders, other);
@@ -7123,11 +7142,13 @@ message_list_thread_with_other_folders (MessageList *message_list,
 			g_ptr_array_add (items, info);
 		}
 
-		dd (g_print ("%s: %s: %u seeds, %u hits, %u folders, %u messages added\n", G_STRFUNC,
+		dd (g_print ("%s: %s: %u seeds, %u hits, %u folders, %u messages added in %" G_GINT64_FORMAT " ms\n", G_STRFUNC,
 			camel_folder_get_full_name (folder), g_hash_table_size (seeds), hits->len,
-			g_hash_table_size (opened), g_hash_table_size (foreign_subjects)));
+			g_hash_table_size (opened), g_hash_table_size (foreign_subjects),
+			(g_get_monotonic_time () - started) / 1000));
 
 		g_hash_table_destroy (opened);
+		g_hash_table_destroy (hit_counts);
 		g_ptr_array_unref (hits);
 	}
 
