@@ -114,6 +114,10 @@ mail_reader_set_display_formatter_for_message (EMailReader *reader,
                                                const gchar *message_uid,
                                                CamelMimeMessage *message,
                                                CamelFolder *folder);
+static gboolean
+mail_reader_display_matches (EMailReader *reader,
+                             const gchar *list_uid,
+                             EMailPartList *parts);
 
 static void
 mail_reader_closure_free (EMailReaderClosure *closure)
@@ -892,7 +896,6 @@ action_mail_flag_for_followup_cb (EUIAction *action,
 	g_ptr_array_unref (uids);
 }
 
-static void
 static void
 mail_reader_forward_groups (EMailReader *reader,
 			    GPtrArray *uids,
