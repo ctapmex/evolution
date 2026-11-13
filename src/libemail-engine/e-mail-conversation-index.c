@@ -271,18 +271,29 @@ read_message_cb (CamelStoreDB *storedb,
 }
 
 static FolderSlice *
-folder_slice_load (CamelStore *store,
+folder_slice_load (EMailSession *session,
+                   CamelStore *store,
                    const gchar *folder_name,
                    GCancellable *cancellable,
                    GError **error)
 {
 	CamelStoreDB *db;
+	CamelFolder *open_folder;
 	FolderSlice *slice;
 	GPtrArray *messages;
 	GError *local_error = NULL;
 
 	if (g_cancellable_set_error_if_cancelled (cancellable, error))
 		return NULL;
+
+	/* New messages of an open folder reach the database only when its
+	 * summary is saved. */
+	open_folder = mail_folder_cache_ref_folder (
+		e_mail_session_get_folder_cache (session), store, folder_name);
+	if (open_folder != NULL) {
+		camel_folder_summary_save (camel_folder_get_folder_summary (open_folder), NULL);
+		g_object_unref (open_folder);
+	}
 
 	db = camel_store_get_db (store);
 	if (db == NULL)
@@ -346,33 +357,87 @@ folder_type_skipped (guint32 flags)
 	}
 }
 
-static void
-collect_folder_names (CamelFolderInfo *info,
+static gboolean
+collect_uri_cb (const gchar *uri,
+                gpointer user_data)
+{
+	g_ptr_array_add (user_data, g_strdup (uri));
+
+	return TRUE;
+}
+
+static gboolean
+folder_flags (EMailSession *session,
+              CamelStore *store,
+              const gchar *folder_name,
+              guint32 *out_flags)
+{
+	CamelFolderInfoFlags flags = 0;
+
+	if (!mail_folder_cache_get_folder_info_flags (
+		e_mail_session_get_folder_cache (session),
+		store, folder_name, &flags))
+		return FALSE;
+
+	*out_flags = flags;
+
+	return TRUE;
+}
+
+/* Folder names of @store known to the folder tree. Read from memory:
+ * camel_store_get_folder_info_sync() asks the server on EWS and IMAP
+ * and holds the store's folder lock for the whole request. */
+static gboolean
+collect_folder_names (EMailSession *session,
+                      CamelStore *store,
                       GPtrArray *names,
                       GHashTable *skipped)
 {
-	while (info != NULL) {
-		if (info->full_name != NULL) {
-			if (folder_type_skipped (info->flags))
-				g_hash_table_add (skipped, g_strdup (info->full_name));
+	MailFolderCache *cache;
+	GPtrArray *uris;
+	guint ii;
+
+	cache = e_mail_session_get_folder_cache (session);
+	uris = g_ptr_array_new_with_free_func (g_free);
+	mail_folder_cache_foreach_remote_folder_uri (cache, collect_uri_cb, uris);
+	mail_folder_cache_foreach_local_folder_uri (cache, collect_uri_cb, uris);
+
+	for (ii = 0; ii < uris->len; ii++) {
+		CamelStore *uri_store = NULL;
+		gchar *folder_name = NULL;
+		guint32 flags = 0;
+
+		if (!e_mail_folder_uri_parse (CAMEL_SESSION (session), uris->pdata[ii], &uri_store, &folder_name, NULL))
+			continue;
+
+		if (uri_store == store && folder_name != NULL) {
+			folder_flags (session, store, folder_name, &flags);
+			if (folder_type_skipped (flags))
+				g_hash_table_add (skipped, g_steal_pointer (&folder_name));
 			else
-				g_ptr_array_add (names, g_strdup (info->full_name));
+				g_ptr_array_add (names, g_steal_pointer (&folder_name));
 		}
-		if (info->child != NULL)
-			collect_folder_names (info->child, names, skipped);
-		info = info->next;
+
+		g_clear_object (&uri_store);
+		g_free (folder_name);
 	}
+
+	g_ptr_array_unref (uris);
+
+	return names->len > 0;
 }
 
 static void
 ensure_folders (StoreIndex *index,
+                EMailSession *session,
                 CamelStore *store,
                 const gchar *only_folder_name,
                 GCancellable *cancellable)
 {
 	GPtrArray *needed = NULL;
 	GHashTable *skipped = NULL;
-	CamelFolderInfo *info = NULL;
+	gboolean listed = FALSE;
+	gboolean complete = TRUE;
 	guint ii;
 
 	g_mutex_lock (&index->lock);
@@ -401,36 +466,19 @@ ensure_folders (StoreIndex *index,
 	}
 	g_mutex_unlock (&index->lock);
 
-	if (skipped != NULL) {
-		GError *local_error = NULL;
-
-		info = camel_store_get_folder_info_sync (
-			store, NULL,
-			CAMEL_STORE_FOLDER_INFO_FAST |
-			CAMEL_STORE_FOLDER_INFO_RECURSIVE |
-			CAMEL_STORE_FOLDER_INFO_SUBSCRIBED |
-			CAMEL_STORE_FOLDER_INFO_NO_VIRTUAL,
-			cancellable, &local_error);
-		if (info == NULL) {
-			g_clear_error (&local_error);
-			info = camel_store_get_folder_info_sync (
-				store, NULL,
-				CAMEL_STORE_FOLDER_INFO_FAST |
-				CAMEL_STORE_FOLDER_INFO_RECURSIVE,
-				cancellable, NULL);
-		}
-		if (info != NULL)
-			collect_folder_names (info, needed, skipped);
-		g_clear_pointer (&info, camel_folder_info_free);
-	}
+	if (skipped != NULL)
+		listed = collect_folder_names (session, store, needed, skipped);
 
 	for (ii = 0; needed != NULL && ii < needed->len; ii++) {
 		const gchar *folder_name = needed->pdata[ii];
 		FolderSlice *slice;
+		guint32 flags = 0;
 		gboolean have;
 
-		if (g_cancellable_is_cancelled (cancellable))
+		if (g_cancellable_is_cancelled (cancellable)) {
+			complete = FALSE;
 			break;
+		}
 
 		g_mutex_lock (&index->lock);
 		have = g_hash_table_contains (index->folders, folder_name);
@@ -438,9 +486,18 @@ ensure_folders (StoreIndex *index,
 		if (have)
 			continue;
 
-		slice = folder_slice_load (store, folder_name, cancellable, NULL);
-		if (slice == NULL)
+		if (folder_flags (session, store, folder_name, &flags) &&
+		    folder_type_skipped (flags)) {
+			slice = g_new0 (FolderSlice, 1);
+			slice->folder_name = g_strdup (folder_name);
+			slice->messages = g_ptr_array_new ();
+		} else {
+			slice = folder_slice_load (session, store, folder_name, cancellable, NULL);
+		}
+		if (slice == NULL) {
+			complete = FALSE;
 			continue;
+		}
 
 		g_mutex_lock (&index->lock);
 		if (g_hash_table_contains (index->folders, folder_name))
@@ -466,9 +523,19 @@ ensure_folders (StoreIndex *index,
 				g_hash_table_insert (index->folders, empty->folder_name, empty);
 			}
 		}
-		index->scanned = TRUE;
+		/* A cancelled or empty pass must not mark the index as
+		 * built, or it stays empty for the whole session. */
+		if (listed && complete)
+			index->scanned = TRUE;
 		g_mutex_unlock (&index->lock);
 		g_hash_table_destroy (skipped);
+	} else if (!complete && only_folder_name == NULL) {
+		g_mutex_lock (&index->lock);
+		for (ii = 0; ii < needed->len; ii++) {
+			if (!g_hash_table_contains (index->folders, needed->pdata[ii]))
+				g_hash_table_add (index->dirty, g_strdup (needed->pdata[ii]));
+		}
+		g_mutex_unlock (&index->lock);
 	}
 
 	g_clear_pointer (&needed, g_ptr_array_unref);
@@ -677,7 +744,7 @@ e_mail_conversation_index_find_related (EMailSession *session,
 
 	store = camel_folder_get_parent_store (folder);
 	index = store_index_get (store);
-	ensure_folders (index, store, NULL, cancellable);
+	ensure_folders (index, session, store, NULL, cancellable);
 
 	hits = g_ptr_array_new_with_free_func ((GDestroyNotify) e_mail_conversation_hit_free);
 	query_store (
@@ -688,7 +755,7 @@ e_mail_conversation_index_find_related (EMailSession *session,
 	    sent_store != store) {
 		StoreIndex *sent_index = store_index_get (sent_store);
 
-		ensure_folders (sent_index, sent_store, sent_folder_name, cancellable);
+		ensure_folders (sent_index, session, sent_store, sent_folder_name, cancellable);
 		query_store (
 			sent_index, sent_store, NULL,
 			seed_ids, known_message_ids, hide_deleted, hide_junk, hits);
@@ -756,6 +823,38 @@ saved_count_changed (CamelStore *store,
 	return changed;
 }
 
+/* The open folder's summary is current; the saved record lags until
+ * the summary is written back. */
+static gboolean
+folder_message_count (EMailSession *session,
+                      CamelStore *store,
+                      const gchar *folder_name,
+                      guint32 *out_count)
+{
+	CamelFolder *folder;
+	CamelStoreDB *db;
+	CamelStoreDBFolderRecord record;
+	gboolean found = FALSE;
+
+	folder = mail_folder_cache_ref_folder (
+		e_mail_session_get_folder_cache (session), store, folder_name);
+	if (folder != NULL) {
+		*out_count = camel_folder_summary_count (camel_folder_get_folder_summary (folder));
+		g_object_unref (folder);
+		return TRUE;
+	}
+
+	memset (&record, 0, sizeof (record));
+	db = camel_store_get_db (store);
+	if (db != NULL && camel_store_db_read_folder (db, folder_name, &record, NULL)) {
+		*out_count = record.saved_count;
+		found = TRUE;
+		camel_store_db_folder_record_clear (&record);
+	}
+
+	return found;
+}
+
 gboolean
 e_mail_conversation_index_change_affects_folder (EMailSession *session,
                                                  CamelFolder *view_folder,
@@ -764,11 +863,11 @@ e_mail_conversation_index_change_affects_folder (EMailSession *session,
                                                  gint new_messages)
 {
 	CamelStore *view_store;
-	CamelStoreDB *db;
-	CamelStoreDBFolderRecord record;
 	CamelStore *sent_store = NULL;
 	gchar *sent_folder_name = NULL;
-	guint32 type;
+	guint32 count = 0;
+	guint32 type = 0;
+	gboolean watched = FALSE;
 	gboolean affects = FALSE;
 
 	g_return_val_if_fail (E_IS_MAIL_SESSION (session), FALSE);
@@ -785,38 +884,28 @@ e_mail_conversation_index_change_affects_folder (EMailSession *session,
 		return FALSE;
 
 	if (new_messages > 0 && changed_store == view_store) {
-		memset (&record, 0, sizeof (record));
-		db = camel_store_get_db (changed_store);
-		if (db != NULL && camel_store_db_read_folder (db, changed_folder_name, &record, NULL)) {
-			saved_count_changed (changed_store, changed_folder_name, record.saved_count);
-			camel_store_db_folder_record_clear (&record);
-		}
+		if (folder_message_count (session, changed_store, changed_folder_name, &count))
+			saved_count_changed (changed_store, changed_folder_name, count);
 		return TRUE;
 	}
 
-	memset (&record, 0, sizeof (record));
-	db = camel_store_get_db (changed_store);
-	if (db != NULL && camel_store_db_read_folder (db, changed_folder_name, &record, NULL)) {
-		type = record.flags & CAMEL_FOLDER_TYPE_MASK;
-		if (changed_store == view_store &&
-		    (type == CAMEL_FOLDER_TYPE_SENT ||
-		     type == CAMEL_FOLDER_TYPE_DRAFTS ||
-		     type == CAMEL_FOLDER_TYPE_OUTBOX))
-			affects = saved_count_changed (changed_store, changed_folder_name, record.saved_count);
-		camel_store_db_folder_record_clear (&record);
+	if (changed_store == view_store &&
+	    folder_flags (session, changed_store, changed_folder_name, &type)) {
+		type &= CAMEL_FOLDER_TYPE_MASK;
+		watched = type == CAMEL_FOLDER_TYPE_SENT ||
+			type == CAMEL_FOLDER_TYPE_DRAFTS ||
+			type == CAMEL_FOLDER_TYPE_OUTBOX;
 	}
 
-	if (!affects &&
+	if (!watched &&
 	    account_sent_folder (session, view_store, &sent_store, &sent_folder_name) &&
 	    sent_store == changed_store &&
-	    g_strcmp0 (sent_folder_name, changed_folder_name) == 0) {
-		memset (&record, 0, sizeof (record));
-		db = camel_store_get_db (changed_store);
-		if (db != NULL && camel_store_db_read_folder (db, changed_folder_name, &record, NULL)) {
-			affects = saved_count_changed (changed_store, changed_folder_name, record.saved_count);
-			camel_store_db_folder_record_clear (&record);
-		}
-	}
+	    g_strcmp0 (sent_folder_name, changed_folder_name) == 0)
+		watched = TRUE;
+
+	if (watched &&
+	    folder_message_count (session, changed_store, changed_folder_name, &count))
+		affects = saved_count_changed (changed_store, changed_folder_name, count);
 
 	g_clear_object (&sent_store);
 	g_free (sent_folder_name);

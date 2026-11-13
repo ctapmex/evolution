@@ -7093,7 +7093,6 @@ message_list_thread_with_other_folders (MessageList *message_list,
 			CamelFolder *other;
 			CamelMessageInfo *info;
 			gchar *key;
-			guint64 message_id;
 
 			key = g_strdup_printf ("%p\n%s", hit->store, hit->folder_name);
 			other = g_hash_table_lookup (opened, key);
@@ -7108,29 +7107,25 @@ message_list_thread_with_other_folders (MessageList *message_list,
 
 				g_hash_table_insert (opened, key, other);
 				g_ptr_array_add (regen_data->extra_folders, other);
-				camel_folder_summary_prepare_fetch_all (
-					camel_folder_get_folder_summary (other), NULL);
 			} else {
 				g_free (key);
 			}
 
+			/* The index already left out copies of messages
+			 * shown here and of earlier hits. */
 			info = camel_folder_get_message_info (other, hit->uid);
 			if (info == NULL)
 				continue;
-
-			message_id = camel_message_info_get_message_id (info);
-			if (message_id != 0 && g_hash_table_contains (known, &message_id)) {
-				g_object_unref (info);
-				continue;
-			}
-			if (message_id != 0)
-				ml_id_set_add (known, message_id);
 
 			g_hash_table_insert (
 				foreign_subjects, info,
 				g_strdup_printf ("\001evo-xfld-subject\001%p", (gpointer) info));
 			g_ptr_array_add (items, info);
 		}
+
+		dd (g_print ("%s: %s: %u seeds, %u hits, %u folders, %u messages added\n", G_STRFUNC,
+			camel_folder_get_full_name (folder), g_hash_table_size (seeds), hits->len,
+			g_hash_table_size (opened), g_hash_table_size (foreign_subjects)));
 
 		g_hash_table_destroy (opened);
 		g_ptr_array_unref (hits);
