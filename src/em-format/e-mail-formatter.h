@@ -156,6 +156,12 @@ void		e_mail_formatter_set_pin_message_headers
 						(EMailFormatter *formatter,
 						 gboolean pin_message_headers);
 
+gboolean	e_mail_formatter_get_attachments_in_bar
+						(EMailFormatter *formatter);
+void		e_mail_formatter_set_attachments_in_bar
+						(EMailFormatter *formatter,
+						 gboolean attachments_in_bar);
+
 gboolean	e_mail_formatter_get_animate_images
 						(EMailFormatter *formatter);
 void		e_mail_formatter_set_animate_images

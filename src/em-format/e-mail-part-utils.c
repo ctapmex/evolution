@@ -728,16 +728,17 @@ cid_uri_is_reference (const gchar *html,
 
 static const gchar *
 cid_uri_content_id_end (const gchar *id,
+			const gchar *end,
 			gchar delimiter)
 {
 	if (delimiter == '"' || delimiter == '\'') {
-		while (*id && *id != delimiter)
+		while (id < end && *id && *id != delimiter)
 			id++;
 
 		return id;
 	}
 
-	while (*id &&
+	while (id < end && *id &&
 	       !g_ascii_isspace (*id) &&
 	       *id != '"' && *id != '\'' &&
 	       *id != ')' && *id != '<' &&
@@ -801,49 +802,51 @@ e_mail_part_dup_cid_uri (const gchar *uri)
 
 /**
  * e_mail_part_rewrite_cid_uris:
- * @html: HTML to scan; can be %NULL
+ * @html: HTML to rewrite in place; can be %NULL
  *
  * Rewrites opaque "cid:…" references in attributes and CSS url() values to
  * "cid://evo/&lt;percent-encoded-id&gt;", which matches the WebKitGTK CORS
  * allow list. References that are already hierarchical are left as they are.
  * The original MIME part is not modified; only this HTML copy changes.
  *
- * Returns: (transfer full) (nullable): a newly allocated HTML string when at
- *    least one reference was rewritten, or %NULL when there is nothing to change
+ * Returns: whether at least one reference was rewritten
  **/
-gchar *
-e_mail_part_rewrite_cid_uris (const gchar *html)
+gboolean
+e_mail_part_rewrite_cid_uris (GString *html)
 {
-	GString *out;
-	const gchar *p;
-	gboolean changed = FALSE;
+	GString *out = NULL;
+	const gchar *p, *end, *copied;
 
-	if (!html || !*html)
-		return NULL;
+	if (!html || !html->len)
+		return FALSE;
 
-	out = g_string_sized_new (strlen (html) + 16);
-	p = html;
+	p = copied = html->str;
+	end = html->str + html->len;
 
-	while (*p) {
+	while (p + 4 <= end) {
 		const gchar *id, *id_end;
 		gchar *content_id, *escaped;
 		gchar delimiter = 0;
 
-		if (g_ascii_strncasecmp (p, "cid:", 4) != 0 ||
-		    !cid_uri_is_reference (html, p, &delimiter) ||
-		    g_ascii_strncasecmp (p + 4, "//", 2) == 0) {
-			g_string_append_c (out, *p);
+		if ((*p != 'c' && *p != 'C') ||
+		    g_ascii_strncasecmp (p, "cid:", 4) != 0 ||
+		    g_ascii_strncasecmp (p + 4, "//", 2) == 0 ||
+		    !cid_uri_is_reference (html->str, p, &delimiter)) {
 			p++;
 			continue;
 		}
 
 		id = p + 4;
-		id_end = cid_uri_content_id_end (id, delimiter);
+		id_end = cid_uri_content_id_end (id, end, delimiter);
 		if (id_end == id) {
-			g_string_append_c (out, *p);
 			p++;
 			continue;
 		}
+
+		if (!out)
+			out = g_string_sized_new (html->len + 16);
+
+		g_string_append_len (out, copied, p - copied);
 
 		content_id = g_strndup (id, id_end - id);
 		escaped = g_uri_escape_string (content_id, NULL, FALSE);
@@ -852,16 +855,19 @@ e_mail_part_rewrite_cid_uris (const gchar *html)
 		g_free (escaped);
 		g_free (content_id);
 
-		changed = TRUE;
-		p = id_end;
+		p = copied = id_end;
 	}
 
-	if (!changed) {
-		g_string_free (out, TRUE);
-		return NULL;
-	}
+	if (!out)
+		return FALSE;
 
-	return g_string_free (out, FALSE);
+	g_string_append_len (out, copied, end - copied);
+
+	g_string_truncate (html, 0);
+	g_string_append_len (html, out->str, out->len);
+	g_string_free (out, TRUE);
+
+	return TRUE;
 }
 
 static gboolean

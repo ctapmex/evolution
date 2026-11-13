@@ -128,7 +128,7 @@ emfe_text_html_format (EMailFormatterExtension *extension,
 	if (context->mode == E_MAIL_FORMATTER_MODE_RAW) {
 		GOutputStream *mem;
 		GBytes *bytes;
-		gchar *html, *rewritten;
+		GString *html;
 		const guint8 *data;
 		gsize length;
 
@@ -141,22 +141,18 @@ emfe_text_html_format (EMailFormatterExtension *extension,
 		g_object_unref (mem);
 
 		data = g_bytes_get_data (bytes, &length);
-		html = g_strndup ((const gchar *) data, length);
+		html = g_string_new_len ((const gchar *) data, length);
+		g_bytes_unref (bytes);
 
-		rewritten = e_mail_part_rewrite_cid_uris (html);
-		if (rewritten) {
+		e_mail_part_rewrite_cid_uris (html);
+
+		if (html->len) {
 			g_output_stream_write_all (
-				stream, rewritten, strlen (rewritten),
-				NULL, cancellable, NULL);
-			g_free (rewritten);
-		} else if (length) {
-			g_output_stream_write_all (
-				stream, data, length,
+				stream, html->str, html->len,
 				NULL, cancellable, NULL);
 		}
 
-		g_bytes_unref (bytes);
-		g_free (html);
+		g_string_free (html, TRUE);
 
 		return TRUE;
 
@@ -338,15 +334,7 @@ emfe_text_html_format (EMailFormatterExtension *extension,
 		if (valid)
 			g_string_truncate (string, tag - string->str);
 
-		{
-			gchar *rewritten;
-
-			rewritten = e_mail_part_rewrite_cid_uris (string->str);
-			if (rewritten) {
-				g_string_assign (string, rewritten);
-				g_free (rewritten);
-			}
-		}
+		e_mail_part_rewrite_cid_uris (string);
 
 		g_output_stream_write_all (
 			stream, string->str, string->len,

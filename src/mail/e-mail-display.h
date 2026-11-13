@@ -67,6 +67,11 @@ EMailFormatter *
 EMailPartList *	e_mail_display_get_part_list	(EMailDisplay *display);
 void		e_mail_display_set_part_list	(EMailDisplay *display,
 						 EMailPartList *part_list);
+gboolean	e_mail_display_get_attachments_in_bar
+						(EMailDisplay *display);
+void		e_mail_display_set_attachments_in_bar
+						(EMailDisplay *display,
+						 gboolean attachments_in_bar);
 gboolean	e_mail_display_get_headers_collapsable
 						(EMailDisplay *display);
 void		e_mail_display_set_headers_collapsable

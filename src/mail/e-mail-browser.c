@@ -806,6 +806,8 @@ mail_browser_constructed (GObject *object)
 		e_attachment_store_transform_num_attachments_to_visible_boolean,
 		NULL, NULL, NULL);
 
+	e_mail_display_set_attachments_in_bar (E_MAIL_DISPLAY (display), TRUE);
+
 	e_plugin_ui_register_manager (browser->priv->ui_manager, "org.gnome.evolution.mail.browser", object);
 
 	action = e_mail_reader_get_action (reader, "mail-label-none");

@@ -110,6 +110,7 @@ empe_mp_related_parse (EMailParserExtension *extension,
 	for (i = 0; i < nparts; i++) {
 		GQueue work_queue = G_QUEUE_INIT;
 		GList *head, *link;
+		gint subpart_index = 0;
 
 		body_part = camel_multipart_get_part (mp, i);
 
@@ -124,11 +125,11 @@ empe_mp_related_parse (EMailParserExtension *extension,
 
 		head = g_queue_peek_head_link (&work_queue);
 
-		for (link = head; link != NULL; link = g_list_next (link)) {
+		for (link = head; link != NULL; link = g_list_next (link), subpart_index++) {
 			EMailPart *mail_part = link->data;
-			gboolean can_be_attachment;
-			gboolean real_attachment = FALSE;
+			gboolean has_wrapper = FALSE;
 			const gchar *cid;
+			GList *other;
 
 			/* An attachment wrapper is the file listing itself.
 			 * Leave it visible; the image parser already created
@@ -137,28 +138,34 @@ empe_mp_related_parse (EMailParserExtension *extension,
 				continue;
 
 			cid = e_mail_part_get_cid (mail_part);
-			can_be_attachment = cid && E_IS_MAIL_PART_IMAGE (mail_part) &&
-				e_mail_part_get_is_attachment (mail_part) && mail_part->is_hidden;
 
-			if (can_be_attachment) {
-				CamelMimePart *img_part;
-
-				img_part = e_mail_part_ref_mime_part (mail_part);
-				if (img_part) {
-					real_attachment = camel_content_disposition_is_attachment_ex (
-						camel_mime_part_get_content_disposition (img_part),
-						camel_mime_part_get_content_type (img_part),
-						camel_mime_part_get_content_type (part));
-					g_object_unref (img_part);
-				}
+			/* The HTML shows a referenced part. An inline image is
+			 * message content even when it has a file name, so it
+			 * is not offered as an attachment. */
+			if (e_mail_part_utils_body_refers (html_body, cid)) {
+				mail_part->is_hidden = TRUE;
+				continue;
 			}
 
-			/* The HTML already shows a referenced part. An inline
-			 * image is message content even when it has a file
-			 * name, so it is not offered as an attachment. */
-			if (e_mail_part_utils_body_refers (html_body, cid) ||
-			    (can_be_attachment && !real_attachment))
-				mail_part->is_hidden = TRUE;
+			if (!cid || !E_IS_MAIL_PART_IMAGE (mail_part) || !mail_part->is_hidden)
+				continue;
+
+			for (other = head; other && !has_wrapper; other = g_list_next (other))
+				has_wrapper = E_IS_MAIL_PART_ATTACHMENT (other->data);
+
+			/* Nothing would show a hidden image the HTML does not
+			 * refer to, so list it as a file. */
+			if (!has_wrapper) {
+				gint sub_partidlen;
+
+				sub_partidlen = part_id->len;
+				g_string_append_printf (part_id, ".subpart.%d", subpart_index);
+
+				e_mail_parser_wrap_as_attachment (parser, body_part, part_id,
+					E_MAIL_PARSER_WRAP_ATTACHMENT_FLAG_NONE, &work_queue);
+
+				g_string_truncate (part_id, sub_partidlen);
+			}
 		}
 
 		g_string_truncate (part_id, partidlen);
