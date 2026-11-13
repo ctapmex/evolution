@@ -28,6 +28,64 @@ static const gchar *parser_mime_types[] = {
 	NULL
 };
 
+static void
+empe_mp_mixed_append_html (CamelMimePart *part,
+			   GString *html,
+			   GCancellable *cancellable)
+{
+	CamelContentType *ct;
+	CamelDataWrapper *dw;
+
+	ct = camel_mime_part_get_content_type (part);
+	dw = camel_medium_get_content (CAMEL_MEDIUM (part));
+
+	if (!ct || !dw)
+		return;
+
+	if (camel_content_type_is (ct, "text", "html")) {
+		CamelStream *mem;
+		GByteArray *bytes;
+
+		mem = camel_stream_mem_new ();
+		camel_data_wrapper_decode_to_stream_sync (dw, mem, cancellable, NULL);
+
+		bytes = camel_stream_mem_get_byte_array (CAMEL_STREAM_MEM (mem));
+		if (bytes && bytes->len)
+			g_string_append_len (html, (const gchar *) bytes->data, bytes->len);
+
+		g_object_unref (mem);
+	} else if (CAMEL_IS_MULTIPART (dw) && (
+		   camel_content_type_is (ct, "multipart", "alternative") ||
+		   camel_content_type_is (ct, "multipart", "related"))) {
+		gint ii, n;
+
+		n = camel_multipart_get_number (CAMEL_MULTIPART (dw));
+		for (ii = 0; ii < n; ii++)
+			empe_mp_mixed_append_html (camel_multipart_get_part (CAMEL_MULTIPART (dw), ii), html, cancellable);
+	}
+}
+
+/* Whether an HTML body among the parts of @mp shows @cid. The HTML is read
+ * only once, on the first call. */
+static gboolean
+empe_mp_mixed_html_refers (CamelMultipart *mp,
+			   GString **inout_html,
+			   const gchar *cid,
+			   GCancellable *cancellable)
+{
+	if (!*inout_html) {
+		gint ii, n;
+
+		*inout_html = g_string_new ("");
+
+		n = camel_multipart_get_number (mp);
+		for (ii = 0; ii < n; ii++)
+			empe_mp_mixed_append_html (camel_multipart_get_part (mp, ii), *inout_html, cancellable);
+	}
+
+	return e_mail_part_utils_body_refers ((*inout_html)->str, cid);
+}
+
 static gboolean
 empe_mp_mixed_parse (EMailParserExtension *extension,
                      EMailParser *parser,
@@ -38,6 +96,7 @@ empe_mp_mixed_parse (EMailParserExtension *extension,
 {
 	CamelMultipart *mp;
 	CamelMimePart *pgp_encrypted = NULL, *pgp_octet_stream = NULL;
+	GString *html = NULL;
 	gint i, nparts, len;
 
 	mp = (CamelMultipart *) camel_medium_get_content ((CamelMedium *) part);
@@ -217,16 +276,19 @@ empe_mp_mixed_parse (EMailParserExtension *extension,
 		/* A Content-ID does not by itself make a file attachment.
 		 * Inline images and text stay in the message body and are
 		 * shown through cid: when the HTML refers to them. List the
-		 * part only when Camel treats it as an attachment, the same
-		 * rule as the message-list paperclip. */
+		 * part when Camel treats it as an attachment, the same rule
+		 * as the message-list paperclip, or when it is hidden and no
+		 * HTML shows it. */
 		if (mail_part != NULL &&
 		    e_mail_part_get_cid (mail_part) != NULL &&
 		    (!e_mail_part_get_is_attachment (mail_part) ||
 		     mail_part->is_hidden) &&
-		    camel_content_disposition_is_attachment_ex (
+		    (camel_content_disposition_is_attachment_ex (
 			camel_mime_part_get_content_disposition (subpart),
 			ct,
-			camel_mime_part_get_content_type (part))) {
+			camel_mime_part_get_content_type (part)) ||
+		     (mail_part->is_hidden &&
+		      !empe_mp_mixed_html_refers (mp, &html, e_mail_part_get_cid (mail_part), cancellable)))) {
 
 			e_mail_parser_wrap_as_attachment (parser, subpart, part_id, E_MAIL_PARSER_WRAP_ATTACHMENT_FLAG_NONE, &work_queue);
 
@@ -251,6 +313,9 @@ empe_mp_mixed_parse (EMailParserExtension *extension,
 		if (ct)
 			camel_content_type_unref (ct);
 	}
+
+	if (html)
+		g_string_free (html, TRUE);
 
 	return TRUE;
 }
