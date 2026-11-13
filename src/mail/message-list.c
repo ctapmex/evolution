@@ -97,6 +97,7 @@ struct _MessageListPrivate {
 	GHashTable *foreign_subjects; /* CamelMessageInfo * -> decorated subject */
 	GHashTable *foreign_subjects_trimmed;
 	gulong folder_cache_changed_id;
+	gboolean other_folders_regen_pending;
 	gboolean any_row_changed; /* save state before regen list when this is set to true */
 	gboolean regen_selects_unread;
 
@@ -3474,10 +3475,20 @@ message_list_cache_folder_changed_cb (MailFolderCache *cache,
 	}
 	g_clear_object (&view);
 
-	if (message_list->frozen)
+	if (message_list->frozen) {
 		message_list->priv->thaw_needs_regen = TRUE;
-	else
-		mail_regen_list (message_list, NULL, NULL);
+		return;
+	}
+
+	/* A running rebuild already reads the index. Cancelling it here
+	 * starts a new status icon and, on a busy account, never lets the
+	 * first one finish. Remember that one more pass is needed. */
+	if (message_list->priv->regen_task != NULL) {
+		message_list->priv->other_folders_regen_pending = TRUE;
+		return;
+	}
+
+	mail_regen_list (message_list, NULL, NULL);
 }
 
 static void
@@ -7888,6 +7899,16 @@ message_list_regen_done_cb (GObject *source_object,
 	}
 
 	e_util_call_malloc_trim_limited ();
+
+	if (message_list->priv->other_folders_regen_pending &&
+	    !message_list->priv->destroyed &&
+	    message_list->priv->thread_include_other_folders &&
+	    message_list_get_group_by_threads (message_list)) {
+		message_list->priv->other_folders_regen_pending = FALSE;
+		mail_regen_list (message_list, NULL, NULL);
+	} else {
+		message_list->priv->other_folders_regen_pending = FALSE;
+	}
 }
 
 static gboolean

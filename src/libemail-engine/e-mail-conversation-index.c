@@ -30,6 +30,8 @@ typedef struct _StoreIndex {
 	GMutex lock;
 	GHashTable *folders; /* folder name -> FolderSlice * */
 	GHashTable *by_id; /* guint64 * -> GPtrArray of ConvMsg * */
+	GHashTable *dirty; /* folder names whose slice must be reread locally */
+	GHashTable *saved_counts; /* folder name -> saved message count */
 	gboolean scanned;
 } StoreIndex;
 
@@ -172,6 +174,8 @@ store_index_free (StoreIndex *index)
 		index->folders = NULL;
 	}
 	g_hash_table_destroy (index->by_id);
+	g_clear_pointer (&index->dirty, g_hash_table_destroy);
+	g_clear_pointer (&index->saved_counts, g_hash_table_destroy);
 	g_mutex_unlock (&index->lock);
 	g_mutex_clear (&index->lock);
 	g_free (index);
@@ -189,6 +193,8 @@ store_index_get (CamelStore *store)
 		g_mutex_init (&index->lock);
 		index->folders = g_hash_table_new (g_str_hash, g_str_equal);
 		index->by_id = g_hash_table_new_full (id_hash, id_equal, g_free, (GDestroyNotify) g_ptr_array_unref);
+		index->dirty = g_hash_table_new_full (g_str_hash, g_str_equal, g_free, NULL);
+		index->saved_counts = g_hash_table_new_full (g_str_hash, g_str_equal, g_free, NULL);
 		g_object_set_data_full (
 			G_OBJECT (store), "evo-conversation-index",
 			index, (GDestroyNotify) store_index_free);
@@ -380,13 +386,22 @@ ensure_folders (StoreIndex *index,
 	} else if (!index->scanned) {
 		needed = g_ptr_array_new_with_free_func (g_free);
 		skipped = g_hash_table_new_full (g_str_hash, g_str_equal, g_free, NULL);
+	} else if (index->dirty != NULL && g_hash_table_size (index->dirty) > 0) {
+		GHashTableIter iter;
+		gpointer key;
+
+		needed = g_ptr_array_new_with_free_func (g_free);
+		g_hash_table_iter_init (&iter, index->dirty);
+		while (g_hash_table_iter_next (&iter, &key, NULL))
+			g_ptr_array_add (needed, g_strdup (key));
+		g_hash_table_remove_all (index->dirty);
 	} else {
 		g_mutex_unlock (&index->lock);
 		return;
 	}
 	g_mutex_unlock (&index->lock);
 
-	if (only_folder_name == NULL) {
+	if (skipped != NULL) {
 		GError *local_error = NULL;
 
 		info = camel_store_get_folder_info_sync (
@@ -699,15 +714,46 @@ e_mail_conversation_index_invalidate_folder (CamelStore *store,
 		return;
 
 	g_mutex_lock (&index->lock);
-	index->scanned = FALSE;
 	if (folder_name != NULL) {
 		slice = g_hash_table_lookup (index->folders, folder_name);
 		if (slice != NULL) {
 			g_hash_table_steal (index->folders, folder_name);
 			folder_slice_free (slice, index);
 		}
+		if (index->dirty != NULL)
+			g_hash_table_add (index->dirty, g_strdup (folder_name));
+	} else {
+		index->scanned = FALSE;
 	}
 	g_mutex_unlock (&index->lock);
+}
+
+/* TRUE only when this folder's saved message count differs from the
+ * count already seen. The first observation is remembered and does
+ * not count: opening a folder to read its summary also emits
+ * folder-changed, and treating that as new mail rebuilds the list
+ * forever. */
+static gboolean
+saved_count_changed (CamelStore *store,
+                     const gchar *folder_name,
+                     guint32 saved_count)
+{
+	StoreIndex *index;
+	gpointer old = NULL;
+	gboolean known;
+	gboolean changed;
+
+	index = store_index_get (store);
+
+	g_mutex_lock (&index->lock);
+	if (index->saved_counts == NULL)
+		index->saved_counts = g_hash_table_new_full (g_str_hash, g_str_equal, g_free, NULL);
+	known = g_hash_table_lookup_extended (index->saved_counts, folder_name, NULL, &old);
+	changed = known && GPOINTER_TO_UINT (old) != saved_count;
+	g_hash_table_insert (index->saved_counts, g_strdup (folder_name), GUINT_TO_POINTER (saved_count));
+	g_mutex_unlock (&index->lock);
+
+	return changed;
 }
 
 gboolean
@@ -738,24 +784,38 @@ e_mail_conversation_index_change_affects_folder (EMailSession *session,
 	    g_strcmp0 (changed_folder_name, camel_folder_get_full_name (view_folder)) == 0)
 		return FALSE;
 
-	if (new_messages > 0 && changed_store == view_store)
+	if (new_messages > 0 && changed_store == view_store) {
+		memset (&record, 0, sizeof (record));
+		db = camel_store_get_db (changed_store);
+		if (db != NULL && camel_store_db_read_folder (db, changed_folder_name, &record, NULL)) {
+			saved_count_changed (changed_store, changed_folder_name, record.saved_count);
+			camel_store_db_folder_record_clear (&record);
+		}
 		return TRUE;
+	}
 
 	memset (&record, 0, sizeof (record));
 	db = camel_store_get_db (changed_store);
 	if (db != NULL && camel_store_db_read_folder (db, changed_folder_name, &record, NULL)) {
 		type = record.flags & CAMEL_FOLDER_TYPE_MASK;
-		if (type == CAMEL_FOLDER_TYPE_SENT ||
-		    type == CAMEL_FOLDER_TYPE_DRAFTS ||
-		    type == CAMEL_FOLDER_TYPE_OUTBOX)
-			affects = changed_store == view_store;
+		if (changed_store == view_store &&
+		    (type == CAMEL_FOLDER_TYPE_SENT ||
+		     type == CAMEL_FOLDER_TYPE_DRAFTS ||
+		     type == CAMEL_FOLDER_TYPE_OUTBOX))
+			affects = saved_count_changed (changed_store, changed_folder_name, record.saved_count);
 		camel_store_db_folder_record_clear (&record);
 	}
 
 	if (!affects &&
-	    account_sent_folder (session, view_store, &sent_store, &sent_folder_name)) {
-		affects = sent_store == changed_store &&
-			g_strcmp0 (sent_folder_name, changed_folder_name) == 0;
+	    account_sent_folder (session, view_store, &sent_store, &sent_folder_name) &&
+	    sent_store == changed_store &&
+	    g_strcmp0 (sent_folder_name, changed_folder_name) == 0) {
+		memset (&record, 0, sizeof (record));
+		db = camel_store_get_db (changed_store);
+		if (db != NULL && camel_store_db_read_folder (db, changed_folder_name, &record, NULL)) {
+			affects = saved_count_changed (changed_store, changed_folder_name, record.saved_count);
+			camel_store_db_folder_record_clear (&record);
+		}
 	}
 
 	g_clear_object (&sent_store);
