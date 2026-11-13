@@ -178,6 +178,13 @@ mail_shell_content_constructed (GObject *object)
 		mail_shell_content_transform_num_attachments_to_visible_boolean_with_settings,
 		NULL, NULL, NULL);
 
+	settings = e_util_ref_settings ("org.gnome.evolution.mail");
+	g_settings_bind (
+		settings, "show-attachment-bar",
+		display, "attachments-in-bar",
+		G_SETTINGS_BIND_GET);
+	g_clear_object (&settings);
+
 	widget = e_to_do_pane_new (shell_view);
 	gtk_paned_pack2 (paned, widget, FALSE, FALSE);
 	gtk_widget_show (widget);

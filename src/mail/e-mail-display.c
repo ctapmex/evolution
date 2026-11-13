@@ -67,6 +67,7 @@ struct _EMailDisplayPrivate {
 	gboolean force_image_load;
 	gboolean has_secured_parts;
 	gboolean skip_insecure_parts;
+	gboolean attachments_in_bar;
 
 	GSList *insecure_part_ids;
 
@@ -90,6 +91,7 @@ enum {
 	PROP_0,
 	PROP_ATTACHMENT_STORE,
 	PROP_ATTACHMENT_VIEW,
+	PROP_ATTACHMENTS_IN_BAR,
 	PROP_FORMATTER,
 	PROP_HEADERS_COLLAPSABLE,
 	PROP_HEADERS_COLLAPSED,
@@ -1554,6 +1556,12 @@ mail_display_set_property (GObject *object,
                            GParamSpec *pspec)
 {
 	switch (property_id) {
+		case PROP_ATTACHMENTS_IN_BAR:
+			e_mail_display_set_attachments_in_bar (
+				E_MAIL_DISPLAY (object),
+				g_value_get_boolean (value));
+			return;
+
 		case PROP_HEADERS_COLLAPSABLE:
 			e_mail_display_set_headers_collapsable (
 				E_MAIL_DISPLAY (object),
@@ -1610,6 +1618,13 @@ mail_display_get_property (GObject *object,
 			g_value_set_object (
 				value,
 				e_mail_display_get_attachment_view (
+				E_MAIL_DISPLAY (object)));
+			return;
+
+		case PROP_ATTACHMENTS_IN_BAR:
+			g_value_set_boolean (
+				value,
+				e_mail_display_get_attachments_in_bar (
 				E_MAIL_DISPLAY (object)));
 			return;
 
@@ -2981,6 +2996,13 @@ e_mail_display_class_init (EMailDisplayClass *class)
 			G_PARAM_READABLE |
 			G_PARAM_STATIC_STRINGS);
 
+	properties[PROP_ATTACHMENTS_IN_BAR] =
+		g_param_spec_boolean (
+			"attachments-in-bar", NULL, NULL,
+			FALSE,
+			G_PARAM_READWRITE |
+			G_PARAM_STATIC_STRINGS);
+
 	properties[PROP_FORMATTER] =
 		g_param_spec_object (
 			"formatter", NULL, NULL,
@@ -3295,6 +3317,7 @@ e_mail_display_set_mode (EMailDisplay *display,
 	g_clear_object (&display->priv->formatter);
 	display->priv->formatter = formatter;
 	mail_display_update_formatter_colors (display);
+	e_mail_formatter_set_attachments_in_bar (formatter, display->priv->attachments_in_bar);
 
 	e_signal_connect_notify (
 		formatter, "notify::image-loading-policy",
@@ -3447,6 +3470,34 @@ e_mail_display_set_part_list (EMailDisplay *display,
 	g_object_unref (settings);
 
 	g_object_notify_by_pspec (G_OBJECT (display), properties[PROP_PART_LIST]);
+}
+
+gboolean
+e_mail_display_get_attachments_in_bar (EMailDisplay *display)
+{
+	g_return_val_if_fail (E_IS_MAIL_DISPLAY (display), FALSE);
+
+	return display->priv->attachments_in_bar;
+}
+
+/* Set by the owner which shows the attachment bar for this display. */
+void
+e_mail_display_set_attachments_in_bar (EMailDisplay *display,
+				       gboolean attachments_in_bar)
+{
+	g_return_if_fail (E_IS_MAIL_DISPLAY (display));
+
+	if (display->priv->attachments_in_bar == attachments_in_bar)
+		return;
+
+	display->priv->attachments_in_bar = attachments_in_bar;
+
+	if (display->priv->formatter) {
+		e_mail_formatter_set_attachments_in_bar (display->priv->formatter, attachments_in_bar);
+		e_mail_display_reload (display);
+	}
+
+	g_object_notify_by_pspec (G_OBJECT (display), properties[PROP_ATTACHMENTS_IN_BAR]);
 }
 
 gboolean

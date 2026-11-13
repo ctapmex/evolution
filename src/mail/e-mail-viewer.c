@@ -2179,6 +2179,8 @@ mail_viewer_constructed (GObject *object)
 		e_attachment_store_transform_num_attachments_to_visible_boolean,
 		NULL, NULL, NULL);
 
+	e_mail_display_set_attachments_in_bar (self->priv->mail_display, TRUE);
+
 	g_signal_connect_object (
 		gtk_clipboard_get (GDK_SELECTION_PRIMARY), "owner-change",
 		G_CALLBACK (mail_viewer_update_clipboard_actions), self, G_CONNECT_SWAPPED);

@@ -33,6 +33,7 @@ struct _EMailFormatterPrivate {
 	gboolean show_real_date;
 	gboolean animate_images;
 	gboolean pin_message_headers;
+	gboolean attachments_in_bar;
 
 	GMutex property_lock;
 
@@ -90,6 +91,7 @@ enum {
 	PROP_SHOW_REAL_DATE,
 	PROP_SHOW_SENDER_PHOTO,
 	PROP_PIN_MESSAGE_HEADERS,
+	PROP_ATTACHMENTS_IN_BAR,
 	PROP_TEXT_COLOR,
 	PROP_ERROR_COLOR,
 	N_PROPS
@@ -246,6 +248,12 @@ e_mail_formatter_set_property (GObject *object,
 				g_value_get_boolean (value));
 			return;
 
+		case PROP_ATTACHMENTS_IN_BAR:
+			e_mail_formatter_set_attachments_in_bar (
+				E_MAIL_FORMATTER (object),
+				g_value_get_boolean (value));
+			return;
+
 		case PROP_TEXT_COLOR:
 			e_mail_formatter_set_color (
 				E_MAIL_FORMATTER (object),
@@ -364,6 +372,13 @@ e_mail_formatter_get_property (GObject *object,
 			g_value_set_boolean (
 				value,
 				e_mail_formatter_get_pin_message_headers (
+				E_MAIL_FORMATTER (object)));
+			return;
+
+		case PROP_ATTACHMENTS_IN_BAR:
+			g_value_set_boolean (
+				value,
+				e_mail_formatter_get_attachments_in_bar (
 				E_MAIL_FORMATTER (object)));
 			return;
 
@@ -732,6 +747,13 @@ e_mail_formatter_class_init (EMailFormatterClass *class)
 			TRUE,
 			G_PARAM_READWRITE |
 			G_PARAM_CONSTRUCT |
+			G_PARAM_STATIC_STRINGS);
+
+	properties[PROP_ATTACHMENTS_IN_BAR] =
+		g_param_spec_boolean (
+			"attachments-in-bar", NULL, NULL,
+			FALSE,
+			G_PARAM_READWRITE |
 			G_PARAM_STATIC_STRINGS);
 
 	properties[PROP_TEXT_COLOR] =
@@ -1393,6 +1415,28 @@ e_mail_formatter_set_pin_message_headers (EMailFormatter *formatter,
 	formatter->priv->pin_message_headers = pin_message_headers;
 
 	g_object_notify_by_pspec (G_OBJECT (formatter), properties[PROP_PIN_MESSAGE_HEADERS]);
+}
+
+gboolean
+e_mail_formatter_get_attachments_in_bar (EMailFormatter *formatter)
+{
+	g_return_val_if_fail (E_IS_MAIL_FORMATTER (formatter), FALSE);
+
+	return formatter->priv->attachments_in_bar;
+}
+
+void
+e_mail_formatter_set_attachments_in_bar (EMailFormatter *formatter,
+                                         gboolean attachments_in_bar)
+{
+	g_return_if_fail (E_IS_MAIL_FORMATTER (formatter));
+
+	if (formatter->priv->attachments_in_bar == attachments_in_bar)
+		return;
+
+	formatter->priv->attachments_in_bar = attachments_in_bar;
+
+	g_object_notify_by_pspec (G_OBJECT (formatter), properties[PROP_ATTACHMENTS_IN_BAR]);
 }
 
 gboolean
