@@ -698,7 +698,7 @@ ml_uid_node (MessageList *message_list,
 	if (uid == NULL)
 		return NULL;
 
-	node = ml_uid_node (message_list, uid);
+	node = g_hash_table_lookup (message_list->uid_nodemap, uid);
 	if (node != NULL)
 		return node;
 
