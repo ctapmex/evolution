@@ -1909,6 +1909,7 @@ em_mailer_prefs_construct (EMMailerPrefs *prefs,
 	em_prefs_bind_settings (prefs, settings, "thread-subject", "thread-by-subject", "active");
 	em_prefs_bind_settings (prefs, settings, "thread-flat", "thread-flat", "active");
 	em_prefs_bind_settings (prefs, settings, "thread-flat-outlook", "thread-flat-outlook", "active");
+	em_prefs_bind_settings (prefs, settings, "thread-include-other-folders", "thread-include-other-folders", "active");
 
 	widget = e_builder_get_widget (prefs->priv->builder, "thread-flat-outlook");
 	g_settings_bind (
