@@ -2582,40 +2582,28 @@ camel_mime_part_from_cid (EMailDisplay *display,
 {
 	EMailPartList *part_list;
 	CamelMimeMessage *message;
-	CamelMimePart *mime_part;
+	CidPartLookup lookup;
 	gchar *cid_uri;
+
+	part_list = e_mail_display_get_part_list (display);
+	if (!part_list)
+		return NULL;
+
+	message = e_mail_part_list_get_message (part_list);
+	if (!message)
+		return NULL;
 
 	cid_uri = e_mail_part_dup_cid_uri (uri);
 	if (!cid_uri)
 		return NULL;
 
-	part_list = e_mail_display_get_part_list (display);
-	if (!part_list) {
-		g_free (cid_uri);
-		return NULL;
-	}
-
-	message = e_mail_part_list_get_message (part_list);
-	if (!message) {
-		g_free (cid_uri);
-		return NULL;
-	}
-
-	mime_part = camel_mime_message_get_part_by_content_id (
-		message, cid_uri + 4);
-
-	if (!mime_part) {
-		CidPartLookup lookup;
-
-		lookup.content_id = cid_uri + 4;
-		lookup.part = NULL;
-		camel_mime_message_foreach_part (message, camel_mime_part_from_cid_cb, &lookup);
-		mime_part = lookup.part;
-	}
+	lookup.content_id = cid_uri + 4;
+	lookup.part = NULL;
+	camel_mime_message_foreach_part (message, camel_mime_part_from_cid_cb, &lookup);
 
 	g_free (cid_uri);
 
-	return mime_part;
+	return lookup.part;
 }
 
 static gchar *
